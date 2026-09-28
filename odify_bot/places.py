@@ -16,6 +16,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
+import phonenumbers
 import requests
 
 from .emails import find_business_email
@@ -76,20 +77,19 @@ def _key(name: str) -> str:
     return key
 
 
-def to_international(phone: str, country_code: str) -> str:
-    """'0803 123 4567' + '234' -> '+234 803 123 4567'. Leaves '+…' numbers alone; returns ''
-    when the number can't be converted safely (no country code configured, odd format)."""
+def to_international(phone: str, region: str = "") -> str:
+    """'22 123 45 67' + 'PL' -> '+48 22 123 45 67'. Any country's format; '+…' numbers need no
+    region. Returns '' when the number can't be read safely."""
     phone = (phone or "").strip()
-    if phone.startswith("+"):
-        return phone
-    cc = country_code.strip().lstrip("+")
-    if not phone or not cc.isdigit():
+    if not phone:
         return ""
-    if phone.startswith("00"):
-        return "+" + phone[2:].strip()
-    if phone.startswith("0"):
-        return f"+{cc} {phone[1:].strip()}"
-    return ""
+    try:
+        num = phonenumbers.parse(phone, region.upper() or None)
+    except phonenumbers.NumberParseException:
+        return ""
+    if not phonenumbers.is_possible_number(num):
+        return ""
+    return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
 
 
 def classify_website(url: str) -> str:
@@ -139,11 +139,15 @@ def _lead(**kw) -> dict:
 
 # ---- Places API (New) ----
 
-def _search_new(query: str, key: str, want: int, keep) -> list[dict]:
+def _search_new(query: str, key: str, want: int, keep, region: str = "", language: str = "") -> list[dict]:
     out: list[dict] = []
     token = None
     for page in range(MAX_PAGES):
         body = {"textQuery": query, "pageSize": 20}
+        if region:
+            body["regionCode"] = region
+        if language:
+            body["languageCode"] = language
         if token:
             body["pageToken"] = token
         resp = None
@@ -189,11 +193,15 @@ def _search_new(query: str, key: str, want: int, keep) -> list[dict]:
 
 # ---- Legacy Places API (fallback) ----
 
-def _search_legacy(query: str, key: str, want: int, keep) -> list[dict]:
+def _search_legacy(query: str, key: str, want: int, keep, region: str = "", language: str = "") -> list[dict]:
     candidates: list[dict] = []
     token = None
     for _ in range(MAX_PAGES):
         params = {"query": query, "key": key}
+        if region:
+            params["region"] = region.lower()
+        if language:
+            params["language"] = language
         if token:
             params["pagetoken"] = token
             time.sleep(2)  # legacy page tokens need ~2s to become valid
@@ -246,11 +254,15 @@ def _search_legacy(query: str, key: str, want: int, keep) -> list[dict]:
 
 # ---- serper.dev ----
 
-def _search_serper(query: str, key: str, want: int, keep) -> list[dict]:
+def _search_serper(query: str, key: str, want: int, keep, region: str = "", language: str = "") -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
     for page in range(1, MAX_PAGES + 1):
         body = {"q": query}
+        if region:
+            body["gl"] = region.lower()
+        if language:
+            body["hl"] = language
         if page > 1:
             body["page"] = page
         try:
@@ -307,6 +319,80 @@ def _enrich_emails(leads: list[dict], location: str) -> None:
             list(pool.map(work, leads))
 
 
+def _run_query(source: str, query: str, want: int, keep, region: str, language: str) -> list[dict]:
+    if source == "serper":
+        return _search_serper(query, _key("SERPER_API_KEY"), want, keep, region, language)
+    mode = os.getenv("PLACES_API_MODE", "auto").lower()
+    key = _key("GOOGLE_PLACES_API_KEY")
+    if mode == "legacy":
+        return _search_legacy(query, key, want, keep, region, language)
+    try:
+        return _search_new(query, key, want, keep, region, language)
+    except _NewApiUnavailable as e:
+        if mode == "new":
+            raise PlacesError(f"Places API (New) not enabled for this key: {e}")
+        log.warning("Places API (New) unavailable, falling back to legacy (costly): %s", e)
+        return _search_legacy(query, key, want, keep, region, language)
+
+
+def search_queries(
+    queries: list[str],
+    max_results: int = 30,
+    include_social: bool = True,
+    exclude_place_ids: set[str] | frozenset[str] = frozenset(),
+    region: str = "",
+    language: str = "",
+    email_location: str = "",
+    enrich_emails: bool = True,
+    progress: Callable[[str], None] | None = None,
+) -> list[dict]:
+    """Run several Maps queries (e.g. one per city), merge them, and return the best
+    `max_results` open businesses with no website (optionally: social-only), best first.
+    `region` (ISO country) and `language` bias results and let local numbers become
+    international so WhatsApp links work."""
+    source = provider()
+    report = progress or (lambda _msg: None)
+    allowed = {"none", "social"} if include_social else {"none"}
+    collected: dict[str, dict] = {}
+
+    def keep(lead: dict) -> bool:
+        pid = lead["place_id"]
+        return lead["web_presence"] in allowed and pid not in exclude_place_ids and pid not in collected
+
+    # One query can fill the whole order; with a fan-out each city only needs its share
+    # (plus slack, since the best leads are picked across all cities afterwards).
+    per_query = max_results if len(queries) == 1 else max(10, math.ceil(max_results * 1.5 / len(queries)))
+    errors: list[Exception] = []
+    for i, query in enumerate(queries, 1):
+        report(f"Scanning Google Maps: {query}" + (f" ({i}/{len(queries)})" if len(queries) > 1 else "") + "…")
+        try:
+            found = _run_query(source, query, per_query, keep, region, language)
+        except PlacesError as e:
+            log.warning("Query %r failed: %s", query, e)
+            errors.append(e)
+            continue
+        for lead in found:
+            collected.setdefault(lead["place_id"], lead)
+    if errors and len(errors) == len(queries):
+        raise errors[-1]
+
+    leads = list(collected.values())
+    for lead in leads:
+        if not lead["intl_phone"]:
+            lead["intl_phone"] = to_international(lead["phone"], region)
+        lead["score"] = lead_score(lead)
+    # Best leads first so a small max_results gets the cream, then enrich only those.
+    leads.sort(key=lambda lead: lead["score"], reverse=True)
+    leads = leads[:max_results]
+    if enrich_emails and leads:
+        report(f"Found {len(leads)} without a website — hunting for emails…")
+        _enrich_emails(leads, email_location)
+    for lead in leads:
+        lead["score"] = lead_score(lead)
+    leads.sort(key=lambda lead: lead["score"], reverse=True)
+    return leads
+
+
 def search_without_website(
     niche: str,
     location: str,
@@ -316,47 +402,6 @@ def search_without_website(
     enrich_emails: bool = True,
     progress: Callable[[str], None] | None = None,
 ) -> list[dict]:
-    """Up to `max_results` open businesses with no website (optionally: social-only),
-    skipping places in `exclude_place_ids`, sorted best lead first."""
-    source = provider()
-    report = progress or (lambda _msg: None)
-    report("Scanning Google Maps…")
-    query = f"{niche} in {location}"
-    allowed = {"none", "social"} if include_social else {"none"}
-
-    def keep(lead: dict) -> bool:
-        return lead["web_presence"] in allowed and lead["place_id"] not in exclude_place_ids
-
-    mode = os.getenv("PLACES_API_MODE", "auto").lower()
-    if source == "serper":
-        leads = _search_serper(query, _key("SERPER_API_KEY"), max_results, keep)
-    elif mode == "legacy":
-        leads = _search_legacy(query, _key("GOOGLE_PLACES_API_KEY"), max_results, keep)
-    else:
-        key = _key("GOOGLE_PLACES_API_KEY")
-        try:
-            leads = _search_new(query, key, max_results, keep)
-        except _NewApiUnavailable as e:
-            if mode == "new":
-                raise PlacesError(f"Places API (New) not enabled for this key: {e}")
-            log.warning("Places API (New) unavailable, falling back to legacy (costly): %s", e)
-            leads = _search_legacy(query, key, max_results, keep)
-
-    # Local numbers ('0803…') can't make WhatsApp links; add the country code if configured.
-    cc = os.getenv("DEFAULT_COUNTRY_CODE", "")
-    for lead in leads:
-        if not lead["intl_phone"]:
-            lead["intl_phone"] = to_international(lead["phone"], cc)
-
-    # Best leads first so a small max_results gets the cream, then enrich only those.
-    for lead in leads:
-        lead["score"] = lead_score(lead)
-    leads.sort(key=lambda lead: lead["score"], reverse=True)
-    leads = leads[:max_results]
-    if enrich_emails and leads:
-        report(f"Found {len(leads)} without a website — hunting for emails…")
-        _enrich_emails(leads, location)
-    for lead in leads:
-        lead["score"] = lead_score(lead)
-    leads.sort(key=lambda lead: lead["score"], reverse=True)
-    return leads
+    """Single '<niche> in <location>' search (used when no LLM is configured)."""
+    return search_queries([f"{niche} in {location}"], max_results, include_social, exclude_place_ids,
+                          email_location=location, enrich_emails=enrich_emails, progress=progress)

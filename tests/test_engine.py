@@ -88,7 +88,7 @@ def _place(i, website="", status="OPERATIONAL", reviews=5):
 def no_enrich(monkeypatch):
     monkeypatch.setattr(gp, "find_business_email", lambda *a, **k: "")
     monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
-    for var in ("PLACES_API_MODE", "PLACES_PROVIDER", "SERPER_API_KEY", "DEFAULT_COUNTRY_CODE"):
+    for var in ("PLACES_API_MODE", "PLACES_PROVIDER", "SERPER_API_KEY"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -158,20 +158,22 @@ def test_provider_selection(monkeypatch, no_enrich):
         gp.provider()
 
 
-@pytest.mark.parametrize("phone,cc,expected", [
-    ("+234 803 123 4567", "", "+234 803 123 4567"),
-    ("0803 123 4567", "234", "+234 803 123 4567"),
-    ("0803 123 4567", "", ""),
-    ("00234 803 123 4567", "234", "+234 803 123 4567"),
-    ("(555) 123-4567", "1", ""),
-    ("", "234", ""),
+@pytest.mark.parametrize("phone,region,expected", [
+    ("+48 601 234 567", "", "+48 601 234 567"),
+    ("22 123 45 67", "PL", "+48 22 123 45 67"),
+    ("601 234 567", "pl", "+48 601 234 567"),
+    ("0803 123 4567", "NG", "+234 803 123 4567"),
+    ("(555) 234-5678", "US", "+1 555-234-5678"),
+    ("601 234 567", "", ""),  # local number, unknown country: can't be made international
+    ("12", "PL", ""),
+    ("", "PL", ""),
 ])
-def test_to_international(phone, cc, expected):
-    assert gp.to_international(phone, cc) == expected
+def test_to_international(phone, region, expected):
+    assert gp.to_international(phone, region) == expected
 
 
-def _serper_place(i, website=None, phone="0803 000 0000", reviews=5):
-    p = {"title": f"Shop {i}", "address": "Ikeja", "phoneNumber": phone, "rating": 4.1,
+def _serper_place(i, website=None, phone="601 000 00" + "0", reviews=5):
+    p = {"title": f"Shop {i}", "address": "Warszawa", "phoneNumber": phone, "rating": 4.1,
          "ratingCount": reviews, "type": "Barber shop", "cid": str(1000 + i), "placeId": f"ChIJ{i}"}
     if website:
         p["website"] = website
@@ -182,13 +184,12 @@ def _serper_place(i, website=None, phone="0803 000 0000", reviews=5):
 def serper(monkeypatch, no_enrich):
     monkeypatch.delenv("GOOGLE_PLACES_API_KEY")
     monkeypatch.setenv("SERPER_API_KEY", "s-key")
-    monkeypatch.setenv("DEFAULT_COUNTRY_CODE", "234")
 
 
 def test_serper_parses_filters_and_paginates(monkeypatch, serper):
     pages = {
-        1: [_serper_place(0, "https://real.ng"), _serper_place(1), _serper_place(2, "https://instagram.com/s2", reviews=90)],
-        2: [_serper_place(1), _serper_place(3, phone="+234 701 000 0000")],  # dup of 1 is ignored
+        1: [_serper_place(0, "https://real.pl"), _serper_place(1), _serper_place(2, "https://instagram.com/s2", reviews=90)],
+        2: [_serper_place(1), _serper_place(3, phone="+48 22 000 00 00")],  # dup of 1 is ignored
         3: [],
     }
     bodies = []
@@ -199,16 +200,42 @@ def test_serper_parses_filters_and_paginates(monkeypatch, serper):
         return Resp(200, {"places": pages[json.get("page", 1)]})
 
     monkeypatch.setattr(gp.requests, "post", post)
-    leads = gp.search_without_website("barbers", "Ikeja", 10)
-    assert bodies[0] == {"q": "barbers in Ikeja"} and bodies[1]["page"] == 2
+    leads = gp.search_queries(["fryzjer Warszawa"], 10, region="PL", language="pl")
+    assert bodies[0] == {"q": "fryzjer Warszawa", "gl": "pl", "hl": "pl"} and bodies[1]["page"] == 2
     ids = [lead["place_id"] for lead in leads]
     assert sorted(ids) == ["ChIJ1", "ChIJ2", "ChIJ3"]
     assert ids[0] == "ChIJ2"  # social-only with most reviews scores highest
     by_id = {lead["place_id"]: lead for lead in leads}
-    assert by_id["ChIJ1"]["intl_phone"] == "+234 803 000 0000"  # converted via DEFAULT_COUNTRY_CODE
-    assert by_id["ChIJ3"]["intl_phone"] == "+234 701 000 0000"
+    assert by_id["ChIJ1"]["intl_phone"] == "+48 601 000 000"  # local number made international via region
+    assert by_id["ChIJ3"]["intl_phone"] == "+48 22 000 00 00"
     assert by_id["ChIJ2"]["web_presence"] == "social"
     assert by_id["ChIJ1"]["maps_url"] == "https://maps.google.com/?cid=1001"
+
+
+def test_fan_out_merges_cities_and_survives_one_failure(monkeypatch, serper):
+    cities = {
+        "fryzjer Warszawa": [_serper_place(1, reviews=10), _serper_place(2, reviews=200)],
+        "fryzjer Kraków": [_serper_place(2, reviews=200), _serper_place(3, reviews=50)],  # 2 appears in both
+        "fryzjer Łódź": "boom",
+    }
+    progress = []
+
+    def post(url, json, headers, timeout):
+        found = cities[json["q"]]
+        if found == "boom":
+            return Resp(500, {})
+        return Resp(200, {"places": found if json.get("page", 1) == 1 else []})
+
+    monkeypatch.setattr(gp.requests, "post", post)
+    leads = gp.search_queries(list(cities), 2, region="PL", language="pl", progress=progress.append)
+    assert [lead["place_id"] for lead in leads] == ["ChIJ2", "ChIJ3"]  # merged, deduped, best 2 kept
+    assert any("(2/3)" in p for p in progress)
+
+
+def test_all_queries_failing_raises(monkeypatch, serper):
+    monkeypatch.setattr(gp.requests, "post", lambda *a, **k: Resp(500, {}))
+    with pytest.raises(gp.PlacesError):
+        gp.search_queries(["a", "b"], 5)
 
 
 def test_serper_errors_are_friendly(monkeypatch, serper):

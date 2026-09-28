@@ -8,8 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @pytest.fixture(autouse=True)
 def temp_db(tmp_path, monkeypatch):
-    """Every test gets its own empty SQLite file."""
+    """Every test gets its own empty SQLite file, and never talks to a real LLM."""
     monkeypatch.setenv("ODIFY_DB", str(tmp_path / "odify.db"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     from odify_bot import store
     store.init_db()
     yield

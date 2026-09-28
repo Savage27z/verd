@@ -115,19 +115,20 @@ def test_stranger_is_rejected(monkeypatch):
 
 
 def test_search_flow_saves_and_sends_cards(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)  # plain parser path
     calls = {}
 
-    def fake_search(niche, location, n, include_social, exclude_place_ids, progress):
-        calls.update(niche=niche, n=n, exclude=set(exclude_place_ids))
+    def fake_search(queries, n, include_social, exclude_place_ids, region, language, email_location, progress):
+        calls.update(queries=queries, n=n, exclude=set(exclude_place_ids), region=region)
         progress("Scanning Google Maps…")
         return fake_leads(7)[:n]
 
-    monkeypatch.setattr(bot.places, "search_without_website", fake_search)
+    monkeypatch.setattr(bot.places, "search_queries", fake_search)
     update, msg, status = make_update("10 barbers in Ikeja")
     ctx, sent = make_context()
     asyncio.run(bot.on_text(update, ctx))
 
-    assert calls == {"niche": "barbers", "n": 10, "exclude": set()}
+    assert calls == {"queries": ["barbers in Ikeja"], "n": 10, "exclude": set(), "region": ""}
     summary = status.edit_text.call_args.args[0]
     assert "<b>7 leads</b>" in summary and "7 WhatsApp-ready" in summary
     cards = [s for s in sent if s[0] == "msg" and "Barber shop" in s[1]]

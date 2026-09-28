@@ -1,14 +1,14 @@
-"""Outreach message template + WhatsApp / email links."""
+"""Outreach message template + WhatsApp links."""
 from urllib.parse import quote
 
 from . import store
 
 DEFAULT_TEMPLATE = (
-    "Hi {name}! I found you on Google Maps{rating_line} and noticed you don't have a website yet. "
+    "Hi {name}! I found you on Google Maps and noticed you don't have a website yet. "
     "I build fast, affordable websites that help local businesses get found on Google and win more "
     "customers. Can I send you a free mockup of what yours could look like?"
 )
-TEMPLATE_VARS = ("{name}", "{category}", "{rating}", "{reviews}", "{rating_line}")
+TEMPLATE_VARS = ("{name}", "{category}", "{rating}", "{reviews}")
 
 
 def get_template() -> str:
@@ -20,13 +20,11 @@ def set_template(text: str | None):
 
 
 def fill(template: str, lead: dict) -> str:
-    rating_line = f" — {lead['rating']}★ from {lead['reviews']} reviews is impressive" if lead.get("rating") else ""
     return (template
-            .replace("{name}", lead.get("name") or "there")
-            .replace("{category}", (lead.get("category") or "business").lower())
+            .replace("{name}", lead.get("name") or "")
+            .replace("{category}", (lead.get("category") or "").lower())
             .replace("{rating}", str(lead["rating"]) if lead.get("rating") else "")
-            .replace("{reviews}", str(lead.get("reviews") or 0))
-            .replace("{rating_line}", rating_line))
+            .replace("{reviews}", str(lead.get("reviews") or 0)))
 
 
 def whatsapp_number(lead: dict) -> str | None:

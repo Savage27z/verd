@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from . import places, store  # noqa: E402
+from . import llm, places, store  # noqa: E402
 from .bot import allowed_ids, build_app  # noqa: E402
 
 
@@ -23,6 +23,10 @@ def main():
     except places.PlacesError as e:
         sys.exit(f"{e} (see .env.example)")
     logging.info("Search provider: %s", source)
+    if llm.enabled():
+        logging.info("LLM: %s via OpenRouter", llm.model())
+    else:
+        logging.warning("OPENROUTER_API_KEY not set — only '<niche> in <location>' messages are understood.")
     if not allowed_ids():
         logging.warning("ALLOWED_USER_IDS is empty — the bot will reply with your user ID so you can set it.")
     store.init_db()

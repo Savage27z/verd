@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from . import store  # noqa: E402
+from . import places, store  # noqa: E402
 from .bot import allowed_ids, build_app  # noqa: E402
 
 
@@ -16,9 +16,13 @@ def main():
                         level=os.getenv("LOG_LEVEL", "INFO"))
     logging.getLogger("httpx").setLevel(logging.WARNING)  # PTB logs every poll otherwise
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    missing = [k for k in ("TELEGRAM_BOT_TOKEN", "GOOGLE_PLACES_API_KEY") if not os.getenv(k)]
-    if missing:
-        sys.exit(f"Missing in .env: {', '.join(missing)} (see .env.example)")
+    if not token:
+        sys.exit("Missing TELEGRAM_BOT_TOKEN (see .env.example)")
+    try:
+        source = places.provider()
+    except places.PlacesError as e:
+        sys.exit(f"{e} (see .env.example)")
+    logging.info("Search provider: %s", source)
     if not allowed_ids():
         logging.warning("ALLOWED_USER_IDS is empty — the bot will reply with your user ID so you can set it.")
     store.init_db()

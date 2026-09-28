@@ -231,7 +231,7 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
             include_social=q["include_social"], exclude_place_ids=seen, progress=progress,
         )
     except places.PlacesError as err:
-        await status.edit_text(f"⚠️ Google Places error:\n<code>{e(err)}</code>", parse_mode=ParseMode.HTML)
+        await status.edit_text(f"⚠️ Search error:\n<code>{e(err)}</code>", parse_mode=ParseMode.HTML)
         return
     except Exception as err:
         log.exception("Search failed")

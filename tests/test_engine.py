@@ -88,7 +88,8 @@ def _place(i, website="", status="OPERATIONAL", reviews=5):
 def no_enrich(monkeypatch):
     monkeypatch.setattr(gp, "find_business_email", lambda *a, **k: "")
     monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
-    monkeypatch.delenv("PLACES_API_MODE", raising=False)
+    for var in ("PLACES_API_MODE", "PLACES_PROVIDER", "SERPER_API_KEY", "DEFAULT_COUNTRY_CODE"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def test_new_api_filters_and_sorts(monkeypatch, no_enrich):
@@ -139,3 +140,81 @@ def test_new_api_mode_forced_raises_when_disabled(monkeypatch, no_enrich):
     with pytest.raises(gp.PlacesError):
         gp.search_without_website("x", "y", 5)
 
+
+# ---- provider selection + serper.dev ----
+
+def test_provider_selection(monkeypatch, no_enrich):
+    assert gp.provider() == "google"
+    monkeypatch.delenv("GOOGLE_PLACES_API_KEY")
+    with pytest.raises(gp.PlacesError):
+        gp.provider()
+    monkeypatch.setenv("SERPER_API_KEY", "s")
+    assert gp.provider() == "serper"
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "k")
+    monkeypatch.setenv("PLACES_PROVIDER", "serper")
+    assert gp.provider() == "serper"
+    monkeypatch.setenv("PLACES_PROVIDER", "bing")
+    with pytest.raises(gp.PlacesError):
+        gp.provider()
+
+
+@pytest.mark.parametrize("phone,cc,expected", [
+    ("+234 803 123 4567", "", "+234 803 123 4567"),
+    ("0803 123 4567", "234", "+234 803 123 4567"),
+    ("0803 123 4567", "", ""),
+    ("00234 803 123 4567", "234", "+234 803 123 4567"),
+    ("(555) 123-4567", "1", ""),
+    ("", "234", ""),
+])
+def test_to_international(phone, cc, expected):
+    assert gp.to_international(phone, cc) == expected
+
+
+def _serper_place(i, website=None, phone="0803 000 0000", reviews=5):
+    p = {"title": f"Shop {i}", "address": "Ikeja", "phoneNumber": phone, "rating": 4.1,
+         "ratingCount": reviews, "type": "Barber shop", "cid": str(1000 + i), "placeId": f"ChIJ{i}"}
+    if website:
+        p["website"] = website
+    return p
+
+
+@pytest.fixture()
+def serper(monkeypatch, no_enrich):
+    monkeypatch.delenv("GOOGLE_PLACES_API_KEY")
+    monkeypatch.setenv("SERPER_API_KEY", "s-key")
+    monkeypatch.setenv("DEFAULT_COUNTRY_CODE", "234")
+
+
+def test_serper_parses_filters_and_paginates(monkeypatch, serper):
+    pages = {
+        1: [_serper_place(0, "https://real.ng"), _serper_place(1), _serper_place(2, "https://instagram.com/s2", reviews=90)],
+        2: [_serper_place(1), _serper_place(3, phone="+234 701 000 0000")],  # dup of 1 is ignored
+        3: [],
+    }
+    bodies = []
+
+    def post(url, json, headers, timeout):
+        assert url == gp.SERPER_API and headers["X-API-KEY"] == "s-key"
+        bodies.append(json)
+        return Resp(200, {"places": pages[json.get("page", 1)]})
+
+    monkeypatch.setattr(gp.requests, "post", post)
+    leads = gp.search_without_website("barbers", "Ikeja", 10)
+    assert bodies[0] == {"q": "barbers in Ikeja"} and bodies[1]["page"] == 2
+    ids = [lead["place_id"] for lead in leads]
+    assert sorted(ids) == ["ChIJ1", "ChIJ2", "ChIJ3"]
+    assert ids[0] == "ChIJ2"  # social-only with most reviews scores highest
+    by_id = {lead["place_id"]: lead for lead in leads}
+    assert by_id["ChIJ1"]["intl_phone"] == "+234 803 000 0000"  # converted via DEFAULT_COUNTRY_CODE
+    assert by_id["ChIJ3"]["intl_phone"] == "+234 701 000 0000"
+    assert by_id["ChIJ2"]["web_presence"] == "social"
+    assert by_id["ChIJ1"]["maps_url"] == "https://maps.google.com/?cid=1001"
+
+
+def test_serper_errors_are_friendly(monkeypatch, serper):
+    monkeypatch.setattr(gp.requests, "post", lambda *a, **k: Resp(403, {"message": "Unauthorized"}))
+    with pytest.raises(gp.PlacesError, match="SERPER_API_KEY"):
+        gp.search_without_website("x", "y", 5)
+    monkeypatch.setattr(gp.requests, "post", lambda *a, **k: Resp(429, {}))
+    with pytest.raises(gp.PlacesError, match="credits"):
+        gp.search_without_website("x", "y", 5)

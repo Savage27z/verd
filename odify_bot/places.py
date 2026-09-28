@@ -1,9 +1,12 @@
 """Find businesses on Google Maps that have no real website.
 
-Primary path is Places API (New) Text Search: one request returns up to 20 places *with*
-website + phone, so a 60-place scan costs ≤3 requests. The legacy API needed a separate
-Place Details call per place (up to ~60 billable calls per search), and is kept only as a
-fallback for keys that don't have "Places API (New)" enabled.
+Two providers, picked by PLACES_PROVIDER (or whichever key is set):
+
+* google — Places API (New) Text Search: one request returns up to 20 places *with*
+  website + phone, so a 60-place scan costs ≤3 requests. The legacy API (one Details call
+  per place) is kept only as a fallback for keys without "Places API (New)" enabled.
+* serper — serper.dev's Google Maps endpoint. No Google Cloud account or card needed;
+  ~20 places per request, same fields.
 """
 import logging
 import math
@@ -21,6 +24,7 @@ log = logging.getLogger("odify.places")
 
 NEW_API = "https://places.googleapis.com/v1/places:searchText"
 LEGACY_API = "https://maps.googleapis.com/maps/api/place"
+SERPER_API = "https://google.serper.dev/maps"
 TIMEOUT = 15
 MAX_PAGES = 3  # Google caps text search at 60 results either way
 
@@ -51,11 +55,41 @@ class _NewApiUnavailable(Exception):
     pass
 
 
-def _api_key() -> str:
-    key = os.getenv("GOOGLE_PLACES_API_KEY", "")
+def provider() -> str:
+    """'google' | 'serper' — explicit PLACES_PROVIDER wins, else whichever key is configured."""
+    explicit = os.getenv("PLACES_PROVIDER", "").strip().lower()
+    if explicit in ("google", "serper"):
+        return explicit
+    if explicit:
+        raise PlacesError(f"PLACES_PROVIDER must be 'google' or 'serper', not {explicit!r}")
+    if os.getenv("GOOGLE_PLACES_API_KEY"):
+        return "google"
+    if os.getenv("SERPER_API_KEY"):
+        return "serper"
+    raise PlacesError("Set SERPER_API_KEY or GOOGLE_PLACES_API_KEY")
+
+
+def _key(name: str) -> str:
+    key = os.getenv(name, "")
     if not key:
-        raise PlacesError("GOOGLE_PLACES_API_KEY not set in .env")
+        raise PlacesError(f"{name} not set")
     return key
+
+
+def to_international(phone: str, country_code: str) -> str:
+    """'0803 123 4567' + '234' -> '+234 803 123 4567'. Leaves '+…' numbers alone; returns ''
+    when the number can't be converted safely (no country code configured, odd format)."""
+    phone = (phone or "").strip()
+    if phone.startswith("+"):
+        return phone
+    cc = country_code.strip().lstrip("+")
+    if not phone or not cc.isdigit():
+        return ""
+    if phone.startswith("00"):
+        return "+" + phone[2:].strip()
+    if phone.startswith("0"):
+        return f"+{cc} {phone[1:].strip()}"
+    return ""
 
 
 def classify_website(url: str) -> str:
@@ -210,6 +244,57 @@ def _search_legacy(query: str, key: str, want: int, keep) -> list[dict]:
     return [lead for lead in leads if keep(lead)]
 
 
+# ---- serper.dev ----
+
+def _search_serper(query: str, key: str, want: int, keep) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for page in range(1, MAX_PAGES + 1):
+        body = {"q": query}
+        if page > 1:
+            body["page"] = page
+        try:
+            resp = requests.post(SERPER_API, json=body, timeout=TIMEOUT,
+                                 headers={"X-API-KEY": key, "Content-Type": "application/json"})
+        except requests.RequestException as e:
+            raise PlacesError(f"Could not reach Serper: {e}")
+        if resp.status_code in (401, 403):
+            raise PlacesError("Serper rejected the API key — check SERPER_API_KEY")
+        if resp.status_code in (402, 429):
+            raise PlacesError("Serper says you're out of credits or rate-limited — check serper.dev dashboard")
+        if not resp.ok:
+            raise PlacesError(f"Serper error {resp.status_code}: {resp.text[:300]}")
+        found = resp.json().get("places") or []
+        new = 0
+        for p in found:
+            cid = str(p.get("cid") or "")
+            place_id = p.get("placeId") or (f"cid:{cid}" if cid else "")
+            if not place_id or place_id in seen:
+                continue
+            seen.add(place_id)
+            new += 1
+            website = p.get("website") or ""
+            phone = p.get("phoneNumber") or ""
+            lead = _lead(
+                place_id=place_id,
+                name=p.get("title", ""),
+                phone=phone,
+                intl_phone=phone if phone.startswith("+") else "",
+                address=p.get("address", ""),
+                website=website,
+                web_presence=classify_website(website),
+                category=p.get("type") or ", ".join((p.get("types") or [])[:1]),
+                rating=p.get("rating"),
+                reviews=p.get("ratingCount") or 0,
+                maps_url=f"https://maps.google.com/?cid={cid}" if cid else "",
+            )
+            if keep(lead):
+                out.append(lead)
+        if not new or len(out) >= want:
+            break
+    return out
+
+
 def _enrich_emails(leads: list[dict], location: str) -> None:
     def work(lead: dict) -> None:
         try:
@@ -233,7 +318,7 @@ def search_without_website(
 ) -> list[dict]:
     """Up to `max_results` open businesses with no website (optionally: social-only),
     skipping places in `exclude_place_ids`, sorted best lead first."""
-    key = _api_key()
+    source = provider()
     report = progress or (lambda _msg: None)
     report("Scanning Google Maps…")
     query = f"{niche} in {location}"
@@ -243,9 +328,12 @@ def search_without_website(
         return lead["web_presence"] in allowed and lead["place_id"] not in exclude_place_ids
 
     mode = os.getenv("PLACES_API_MODE", "auto").lower()
-    if mode == "legacy":
-        leads = _search_legacy(query, key, max_results, keep)
+    if source == "serper":
+        leads = _search_serper(query, _key("SERPER_API_KEY"), max_results, keep)
+    elif mode == "legacy":
+        leads = _search_legacy(query, _key("GOOGLE_PLACES_API_KEY"), max_results, keep)
     else:
+        key = _key("GOOGLE_PLACES_API_KEY")
         try:
             leads = _search_new(query, key, max_results, keep)
         except _NewApiUnavailable as e:
@@ -253,6 +341,12 @@ def search_without_website(
                 raise PlacesError(f"Places API (New) not enabled for this key: {e}")
             log.warning("Places API (New) unavailable, falling back to legacy (costly): %s", e)
             leads = _search_legacy(query, key, max_results, keep)
+
+    # Local numbers ('0803…') can't make WhatsApp links; add the country code if configured.
+    cc = os.getenv("DEFAULT_COUNTRY_CODE", "")
+    for lead in leads:
+        if not lead["intl_phone"]:
+            lead["intl_phone"] = to_international(lead["phone"], cc)
 
     # Best leads first so a small max_results gets the cream, then enrich only those.
     for lead in leads:

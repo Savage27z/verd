@@ -158,25 +158,30 @@ async def localise_pitch(template: str, language: str) -> str:
     if not language or language == "en":
         return template
     placeholders = sorted(set(re.findall(r"\{[a-z_]+\}", template)))
-    try:
-        resp = await client().chat.completions.create(
-            model=model(),
-            messages=[
-                {"role": "system", "content": (
-                    "Translate the user's WhatsApp sales message into the language with ISO 639-1 code "
-                    f"'{language}'. Keep it friendly, natural and short, as a local would write it. Keep these "
-                    f"placeholders exactly as written, untranslated: {' '.join(placeholders) or '(none)'}. "
-                    'Reply with JSON: {"text": "<translated message>"}')},
-                {"role": "user", "content": template},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=800,
-            temperature=0.3,
-        )
-        text = str(_json_from(resp.choices[0].message.content if resp.choices else "").get("text") or "").strip()
-    except (OpenAIError, LLMError) as e:
-        log.warning("Pitch translation failed: %s", e)
-        return template
-    if not text or any(p not in text for p in placeholders):
-        return template  # never ship a pitch that lost the business name
-    return text
+    messages = [
+        {"role": "system", "content": (
+            "Translate the user's WhatsApp sales message into the language with ISO 639-1 code "
+            f"'{language}'. Keep it friendly, natural and short, as a local would write it. Keep these "
+            f"placeholders exactly as written, untranslated: {' '.join(placeholders) or '(none)'}. "
+            "Reply with only the translated message — no quotes, notes or explanations.")},
+        {"role": "user", "content": template},
+    ]
+    # Plain text, not JSON mode: DeepSeek's JSON mode occasionally returns empty content.
+    problem = ""
+    for _attempt in range(2):
+        try:
+            resp = await client().chat.completions.create(
+                model=model(), messages=messages, max_tokens=800, temperature=0.3)
+        except OpenAIError as e:
+            problem = str(e)
+            continue
+        text = (resp.choices[0].message.content or "").strip() if resp.choices else ""
+        text = re.sub(r"^```\w*\s*|\s*```$", "", text).strip().strip('"“”«»').strip()
+        if not text:
+            problem = "empty response"
+        elif any(p not in text for p in placeholders):
+            problem = "placeholder lost"  # never ship a pitch that lost the business name
+        else:
+            return text
+    log.warning("Pitch translation to %s failed (%s); using the original", language, problem)
+    return template

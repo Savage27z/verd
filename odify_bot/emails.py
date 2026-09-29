@@ -52,7 +52,7 @@ def scrape_page(url: str, timeout: int = 8) -> list[str]:
 # Engines that answer from datacenter IPs (Railway etc.). ddgs' default "auto" also hits
 # Google/Brave/Startpage/Mojeek, which block cloud IPs, plus Wikipedia-style engines that
 # never have contact pages — ~10 wasted requests per lead.
-DEFAULT_BACKENDS = "yahoo,bing"
+DEFAULT_BACKENDS = "yahoo,duckduckgo"  # bing is disabled in ddgs on Linux builds
 
 
 def web_search(query: str, max_results: int = 10) -> list[str]:

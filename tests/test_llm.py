@@ -82,11 +82,16 @@ def test_search_without_queries_becomes_single_query_or_chat():
 
 
 def test_localise_pitch_keeps_placeholders_or_falls_back(monkeypatch):
-    use_llm(monkeypatch, json.dumps({"text": "Cześć {name}! Nie macie strony."}),
-            json.dumps({"text": "Cześć! Nie macie strony."}))  # second one lost {name}
+    fake = use_llm(monkeypatch,
+                   '"Cześć {name}! Nie macie strony."',              # plain text; stray quotes stripped
+                   "", "Hallo {name}! Keine Website.",                # empty (DeepSeek quirk) → retried
+                   "Hola! Sin web.", "Hola! Sin web.")                # lost {name} twice → original
     assert asyncio.run(llm.localise_pitch("Hi {name}! No site.", "pl")) == "Cześć {name}! Nie macie strony."
-    assert asyncio.run(llm.localise_pitch("Hi {name}! No site.", "pl")) == "Hi {name}! No site."
+    assert "response_format" not in fake.requests[0]
+    assert asyncio.run(llm.localise_pitch("Hi {name}! No site.", "de")) == "Hallo {name}! Keine Website."
+    assert asyncio.run(llm.localise_pitch("Hi {name}! No site.", "es")) == "Hi {name}! No site."
     assert asyncio.run(llm.localise_pitch("Hi {name}!", "en")) == "Hi {name}!"
+    assert len(fake.requests) == 5
 
 
 # ---- bot routing ----
@@ -132,7 +137,7 @@ COUNTRIES = [
 @pytest.mark.parametrize("text,p,local_phone,wa_digits,pitch,pitch_in_url", COUNTRIES,
                          ids=[c[0] for c in COUNTRIES])
 def test_any_country_search(monkeypatch, text, p, local_phone, wa_digits, pitch, pitch_in_url):
-    use_llm(monkeypatch, json.dumps(p), json.dumps({"text": pitch}))
+    use_llm(monkeypatch, json.dumps(p), pitch)
     calls = {}
 
     def fake_search(queries, n, include_social, exclude_place_ids, region, language, email_location, progress):

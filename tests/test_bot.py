@@ -114,7 +114,8 @@ def test_stranger_is_rejected(monkeypatch):
     assert "private bot" in msg.reply_text.call_args.args[0]
 
 
-def test_search_flow_saves_and_sends_cards(monkeypatch):
+def test_search_flow_saves_and_sends_cards(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="odify.bot")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)  # plain parser path
     calls = {}
 
@@ -135,6 +136,7 @@ def test_search_flow_saves_and_sends_cards(monkeypatch):
     assert len(cards) == bot.PAGE
     assert sent[-1][1] == "Showing 5 of 7"  # pager
     assert store.lead_for_message(5, 101) is not None
+    assert "Search 1: 'barbers' in 'Ikeja'" in caplog.text and "7 leads | phone 7, WhatsApp 7, email 0" in caplog.text
 
     # second search skips what we already have
     update2, _, _ = make_update("barbers in Ikeja")

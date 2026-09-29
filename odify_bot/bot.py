@@ -5,6 +5,7 @@ import html
 import logging
 import os
 import re
+import time
 from functools import wraps
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -301,6 +302,7 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: d
             status.edit_text(f"🔎 {e(plan['niche'])} in {e(where)}\n{e(text)}", parse_mode=ParseMode.HTML), loop)
 
     seen = set() if plan["include_seen"] else store.seen_place_ids()
+    started = time.monotonic()
     search_job = asyncio.to_thread(
         places.search_queries, queries, count,
         include_social=plan["include_social"], exclude_place_ids=seen, region=plan["country_iso"],
@@ -311,6 +313,7 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: d
     try:
         leads, pitch = await asyncio.gather(search_job, pitch_job)
     except places.PlacesError as err:
+        log.warning("Search for %r in %r failed: %s", plan["niche"], where, err)
         await status.edit_text(f"⚠️ Search error:\n<code>{e(err)}</code>", parse_mode=ParseMode.HTML)
         return
     except Exception as err:
@@ -325,6 +328,13 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: d
     search_id = store.save_search(plan["niche"], where, count, options, leads)
     search = store.get_search(search_id)
     saved = store.get_leads(search_id)
+    log.info("Search %d: %r in %r (%s, %s) — %d queries, %d leads | phone %d, WhatsApp %d, email %d, "
+             "social/booking %d | skipped-known %d | pitch %s | %.0fs",
+             search_id, plan["niche"], where, plan["country_iso"] or "?", plan["language"] or "?", len(queries),
+             len(saved), sum(1 for x in saved if x["phone"] or x["intl_phone"]),
+             sum(1 for x in saved if outreach.whatsapp_number(x)), sum(1 for x in saved if x["email"]),
+             sum(1 for x in saved if x["web_presence"] == "social"), len(seen),
+             "translated" if "pitch" in options else "default", time.monotonic() - started)
     note = ""
     if seen:
         note += "\n<i>Skipped leads you already have — say “include ones I already have” to get them too.</i>"

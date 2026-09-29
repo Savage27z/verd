@@ -1,4 +1,5 @@
 """Best-effort email discovery for businesses that have no website."""
+import os
 import re
 from urllib.parse import urlparse
 
@@ -48,12 +49,19 @@ def scrape_page(url: str, timeout: int = 8) -> list[str]:
         return []
 
 
-def search_duckduckgo(query: str, max_results: int = 10) -> list[str]:
+# Engines that answer from datacenter IPs (Railway etc.). ddgs' default "auto" also hits
+# Google/Brave/Startpage/Mojeek, which block cloud IPs, plus Wikipedia-style engines that
+# never have contact pages — ~10 wasted requests per lead.
+DEFAULT_BACKENDS = "yahoo,bing"
+
+
+def web_search(query: str, max_results: int = 10) -> list[str]:
     urls: list[str] = []
     try:
         from ddgs import DDGS
         with DDGS(timeout=8) as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
+            backend = os.getenv("EMAIL_SEARCH_BACKENDS", DEFAULT_BACKENDS)
+            for r in ddgs.text(query, max_results=max_results, backend=backend):
                 urls.append(r["href"])
     except Exception:
         pass
@@ -107,7 +115,7 @@ def find_business_email(name: str, location: str, max_pages: int = 2, website: s
         best = pick_best_email(scrape_page(website), name)
         if best:
             return best
-    urls = search_duckduckgo(f'"{name}" {location} email contact', max_results=max_pages)
+    urls = web_search(f'"{name}" {location} email contact', max_results=max_pages)
     for url in urls:
         strict = any(h in url.lower() for h in DIRECTORY_HINTS)
         best = pick_best_email(scrape_page(url), name, strict=strict)

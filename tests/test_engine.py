@@ -262,3 +262,13 @@ def test_serper_errors_are_friendly(monkeypatch, serper):
     monkeypatch.setattr(gp.requests, "post", lambda *a, **k: Resp(429, {}))
     with pytest.raises(gp.PlacesError, match="credits"):
         gp.search_without_website("x", "y", 5)
+
+
+def test_email_lookup_can_be_turned_off(monkeypatch, serper):
+    called = []
+    monkeypatch.setattr(gp, "find_business_email", lambda *a, **k: called.append(1) or "x@y.pl")
+    monkeypatch.setattr(gp.requests, "post", lambda *a, **k: Resp(200, {"places": [_serper_place(1)]}))
+    monkeypatch.setenv("EMAIL_LOOKUP", "off")
+    assert gp.search_queries(["q"], 5)[0]["email"] == "" and not called
+    monkeypatch.setenv("EMAIL_LOOKUP", "on")
+    assert gp.search_queries(["q"], 5)[0]["email"] == "x@y.pl"

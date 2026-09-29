@@ -319,6 +319,9 @@ def _search_serper(query: str, key: str, want: int, keep, region: str = "", lang
 
 
 def _enrich_emails(leads: list[dict], location: str) -> None:
+    if os.getenv("EMAIL_LOOKUP", "on").lower() in ("off", "0", "false", "no"):
+        return
+
     def work(lead: dict) -> None:
         try:
             lead["email"] = find_business_email(lead.get("name", ""), location, website=lead.get("website", ""))
@@ -326,8 +329,11 @@ def _enrich_emails(leads: list[dict], location: str) -> None:
             lead["email"] = ""
 
     if leads:
+        started = time.monotonic()
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(work, leads))
+        log.info("Email lookup: %d/%d found in %.0fs", sum(1 for lead in leads if lead["email"]), len(leads),
+                 time.monotonic() - started)
 
 
 def _run_query(source: str, query: str, want: int, keep, region: str, language: str) -> list[dict]:

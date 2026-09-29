@@ -14,7 +14,10 @@ from .bot import allowed_ids, build_app  # noqa: E402
 def main():
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         level=os.getenv("LOG_LEVEL", "INFO"))
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # PTB logs every poll otherwise
+    # Per-request chatter from Telegram polling (httpx), the LLM client (httpx2) and the
+    # email web search (primp) drowns out the useful lines.
+    for noisy in ("httpx", "httpx2", "primp", "ddgs"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     if not token:
         sys.exit("Missing TELEGRAM_BOT_TOKEN (see .env.example)")

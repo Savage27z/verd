@@ -36,6 +36,12 @@ async def template_for_language(language: str) -> str:
     return translated
 
 
+def lead_language(lead: dict) -> str:
+    """Language of the search the lead came from (drives previews and follow-up text)."""
+    search = store.get_search(lead["search_id"]) if lead.get("search_id") else None
+    return (search or {}).get("options", {}).get("language") or "en"
+
+
 def fill(template: str, lead: dict) -> str:
     return (template
             .replace("{name}", lead.get("name") or "")

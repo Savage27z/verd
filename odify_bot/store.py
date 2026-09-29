@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS lead_messages (
     lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
     PRIMARY KEY (chat_id, message_id)
 );
+-- Pipeline history (status changes, follow-ups) for the daily digest's numbers.
+CREATE TABLE IF NOT EXISTS lead_events (
+    id INTEGER PRIMARY KEY,
+    lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS lead_events_at_idx ON lead_events (at);
 -- Website previews: an unguessable token per lead, plus who's been looking.
 CREATE TABLE IF NOT EXISTS mockups (
     token TEXT PRIMARY KEY,
@@ -89,10 +97,22 @@ def connect():
         conn.close()
 
 
+MIGRATIONS = {  # (table, column) -> definition; added to databases created before the column existed
+    ("leads", "contacted_at"): "TEXT",
+    ("leads", "followups"): "INTEGER NOT NULL DEFAULT 0",
+}
+
+
 def init_db():
     with connect() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        for (table, column), definition in MIGRATIONS.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        # leads marked contacted before follow-up tracking existed: start their clock from then
+        conn.execute("UPDATE leads SET contacted_at = updated_at WHERE status='contacted' AND contacted_at IS NULL")
 
 
 # ---- searches + leads ----
@@ -153,12 +173,65 @@ def seen_place_ids() -> set[str]:
         return {r["place_id"] for r in rows}
 
 
-def set_status(lead_id: int, status: str) -> dict | None:
+def set_status(lead_id: int, status: str, auto: bool = False) -> dict | None:
     if status not in LEAD_STATUSES:
         raise ValueError(f"status must be one of {', '.join(LEAD_STATUSES)}")
     with connect() as conn:
+        row = conn.execute("SELECT status FROM leads WHERE id=?", (lead_id,)).fetchone()
+        if not row:
+            return None
         conn.execute("UPDATE leads SET status=?, updated_at=datetime('now') WHERE id=?", (status, lead_id))
+        if status == "contacted" and row["status"] != "contacted":
+            # the follow-up clock starts when you first reach out
+            conn.execute("UPDATE leads SET contacted_at=datetime('now'), followups=0 WHERE id=?", (lead_id,))
+        if status != row["status"]:
+            conn.execute("INSERT INTO lead_events (lead_id, kind) VALUES (?, ?)",
+                         (lead_id, f"auto_{status}" if auto else status))
     return get_lead(lead_id)
+
+
+def mark_followed_up(lead_id: int) -> dict | None:
+    """You sent a follow-up: count it and restart the wait."""
+    with connect() as conn:
+        conn.execute("UPDATE leads SET followups = followups + 1, contacted_at=datetime('now'),"
+                     " updated_at=datetime('now') WHERE id=? AND status='contacted'", (lead_id,))
+        conn.execute("INSERT INTO lead_events (lead_id, kind) VALUES (?, 'followup')", (lead_id,))
+    return get_lead(lead_id)
+
+
+def followups_due(older_than: str, max_followups: int = 2, limit: int = 20) -> list[dict]:
+    """Contacted leads waiting since before `older_than` (UTC 'YYYY-MM-DD HH:MM:SS') that still
+    have follow-ups left."""
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM leads WHERE status='contacted' AND contacted_at IS NOT NULL AND contacted_at <= ?"
+            " AND followups < ? ORDER BY score DESC, contacted_at LIMIT ?",
+            (older_than, max_followups, limit)).fetchall()]
+
+
+def exhausted_leads(older_than: str, max_followups: int = 2) -> list[dict]:
+    """Contacted leads that got every follow-up and still no reply since before `older_than`."""
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM leads WHERE status='contacted' AND followups >= ? AND contacted_at <= ?",
+            (max_followups, older_than)).fetchall()]
+
+
+def hot_leads(since: str, limit: int = 10) -> list[dict]:
+    """Contacted (not yet replied) leads who opened their preview since `since`."""
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT l.*, m.views AS preview_views FROM leads l JOIN mockups m ON m.lead_id = l.id"
+            " WHERE l.status='contacted' AND m.last_view_at >= ? ORDER BY m.last_view_at DESC LIMIT ?",
+            (since, limit)).fetchall()]
+
+
+def event_counts(start: str, end: str) -> dict[str, int]:
+    """How many status changes / follow-ups happened in [start, end) (UTC strings)."""
+    with connect() as conn:
+        rows = conn.execute("SELECT kind, count(*) AS n FROM lead_events WHERE at >= ? AND at < ? GROUP BY kind",
+                            (start, end)).fetchall()
+    return {r["kind"]: r["n"] for r in rows}
 
 
 def set_notes(lead_id: int, notes: str) -> dict | None:

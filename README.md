@@ -31,6 +31,18 @@ Tap **🎨 Mockup** on any lead to get a one-page website for that business at `
 - **Privacy:** preview links can't be guessed, and pages are `noindex` so search engines don't list them.
 - **Setup:** give the service a public domain (Railway → service → Settings → Networking → Generate Domain, port 8080). Set `MOCKUP_BRAND` to your studio name, and optionally `MOCKUP_BRAND_URL` to link it (e.g. your WhatsApp).
 
+## Daily digest
+
+Every morning at `DIGEST_TIME` in `DIGEST_TZ`, the bot sends you one message. If it was down at that time, it sends as soon as it's back, once per day. `/digest` sends one whenever you like. It uses no LLM and no search credits.
+
+- **🔥 Hot:** leads you've contacted who opened their website preview in the last day.
+- **⏰ Follow-ups due:** leads marked Contacted `FOLLOWUP_DAYS` (default 3) or more days ago with no reply. Each card has:
+  - a ready follow-up message in the lead's language, including their preview link
+  - their local time, worked out from the phone number, so you don't message someone at 5am
+  - **✅ Followed up**, **💬 They replied** and **❌ Lost** buttons
+- **Auto-close:** after 2 follow-ups with no reply, the lead moves to Lost.
+- **Yesterday's numbers:** contacted, followed up, replied and won, plus your pipeline totals.
+
 ## Setup
 
 You need three keys:

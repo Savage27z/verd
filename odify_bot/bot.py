@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from functools import wraps
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -14,7 +15,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
-from . import exports, llm, mockup, outreach, places, store, web
+from . import digest, exports, llm, mockup, outreach, places, store, web
 
 log = logging.getLogger("odify.bot")
 
@@ -46,6 +47,7 @@ Leads you already have are skipped unless you ask for them again.
 /leads — recent searches
 /pipeline — leads by status
 /template — view or change your pitch
+/digest — today's follow-ups & hot leads (also sent every morning)
 /export — every lead, as CSV"""
 
 
@@ -170,14 +172,9 @@ def lead_keyboard(lead: dict, pitch: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([row1, row2, statuses[:2], statuses[2:]])
 
 
-def search_language(lead: dict) -> str:
-    search = store.get_search(lead["search_id"]) if lead.get("search_id") else None
-    return (search or {}).get("options", {}).get("language") or "en"
-
-
 async def send_mockup(chat_id: int, lead: dict, context: ContextTypes.DEFAULT_TYPE):
     url = web.preview_url(store.mockup_token(lead["id"]))
-    lang = search_language(lead)
+    lang = outreach.lead_language(lead)
     buttons = [[InlineKeyboardButton("🌐 Open preview", url=url)]]
     send = mockup.send_link(lead, url, lang)
     if send:
@@ -419,6 +416,57 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_export(update, context)
 
 
+# ---- daily digest ----
+
+def digest_keyboard(lead: dict) -> InlineKeyboardMarkup:
+    row1 = []
+    link = digest.followup_link(lead)
+    if link:
+        row1.append(InlineKeyboardButton("💬 Send follow-up", url=link))
+    row1.append(InlineKeyboardButton("✅ Followed up", callback_data=f"fu:{lead['id']}"))
+    return InlineKeyboardMarkup([row1, [
+        InlineKeyboardButton("💬 They replied", callback_data=f"st:{lead['id']}:replied"),
+        InlineKeyboardButton("❌ Lost", callback_data=f"st:{lead['id']}:lost"),
+    ]])
+
+
+async def send_digest(tg_bot, chat_id: int, now: datetime | None = None) -> digest.Digest:
+    now = now or datetime.now(timezone.utc)
+    d = digest.build(now)
+    await tg_bot.send_message(chat_id, digest.summary_html(d), parse_mode=ParseMode.HTML)
+    for lead, hot in [(lead, True) for lead in d.hot[:10]] + [(lead, False) for lead in d.due[:10]]:
+        await tg_bot.send_message(chat_id, digest.card_html(lead, now, hot=hot), parse_mode=ParseMode.HTML,
+                                  reply_markup=digest_keyboard(lead), disable_web_page_preview=True)
+    if len(d.due) > 10:
+        await tg_bot.send_message(chat_id, f"…and {len(d.due) - 10} more follow-ups due. Clear these first!")
+    return d
+
+
+async def digest_loop(app: Application):
+    """Sends the digest daily at DIGEST_TIME in DIGEST_TZ (catching up after a restart)."""
+    while True:
+        try:
+            tz, at, _ = digest.settings()
+            now = datetime.now(timezone.utc)
+            if digest.due_now(now, tz, at, store.get_setting("digest_last_sent")):
+                store.set_setting("digest_last_sent", now.astimezone(tz).date().isoformat())
+                for uid in allowed_ids():
+                    await send_digest(app.bot, uid, now)
+                log.info("Daily digest sent")
+            wait = (digest.next_run(datetime.now(timezone.utc), tz, at) - datetime.now(timezone.utc)).total_seconds()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Daily digest failed")
+            wait = 600
+        await asyncio.sleep(max(30.0, min(wait, 3600.0)))  # re-check hourly: survives clock/setting changes
+
+
+@restricted
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_digest(context.bot, update.effective_chat.id)
+
+
 @restricted
 async def cmd_template(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -454,6 +502,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if lead:
             await context.bot.send_document(chat_id, exports.generate_vcard(lead).encode(),
                                             filename=f"{slugify(lead['name'])}.vcf")
+    elif kind == "fu":
+        lead = store.mark_followed_up(int(rest))
+        if not lead or lead["status"] != "contacted":
+            await query.answer("This lead isn't waiting on a reply anymore")
+            return
+        _, _, days = digest.settings()
+        await query.answer("Follow-up logged")
+        last = lead["followups"] >= digest.MAX_FOLLOWUPS
+        await query.edit_message_text(
+            f"✅ Followed up with <b>{e(lead['name'])}</b> ({lead['followups']}/{digest.MAX_FOLLOWUPS}). "
+            + (f"If there's no reply in {days} days I'll move them to Lost." if last
+               else f"I'll remind you again in {days} days if they don't reply."),
+            parse_mode=ParseMode.HTML)
     elif kind == "mk":
         lead = store.get_lead(int(rest))
         if not lead:
@@ -518,6 +579,7 @@ async def _post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("leads", "Recent searches"),
         BotCommand("pipeline", "Leads by status"),
+        BotCommand("digest", "Today's follow-ups & hot leads"),
         BotCommand("template", "View/change your pitch"),
         BotCommand("export", "All leads as CSV"),
         BotCommand("help", "How to use"),
@@ -531,11 +593,22 @@ async def _post_init(app: Application):
         app.bot_data["web"] = web.start(on_view)
     except OSError as err:
         log.error("Preview server could not start: %s", err)
+    tz, at, days = digest.settings()
+    app.bot_data["digest_task"] = asyncio.create_task(digest_loop(app))
+    log.info("Daily digest at %s %s (follow-ups after %d days)", at.strftime("%H:%M"), tz.key, days)
+
+
+async def _post_shutdown(app: Application):
+    task = app.bot_data.get("digest_task")
+    if task:
+        task.cancel()
 
 
 def build_app(token: str) -> Application:
-    app = Application.builder().token(token).concurrent_updates(True).post_init(_post_init).build()
+    app = (Application.builder().token(token).concurrent_updates(True)
+           .post_init(_post_init).post_shutdown(_post_shutdown).build())
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("leads", cmd_leads))
     app.add_handler(CommandHandler("pipeline", cmd_pipeline))

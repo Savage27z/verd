@@ -142,7 +142,7 @@ def lead_card(lead: dict) -> str:
     if lead.get("address"):
         lines.append(f"📍 {e(lead['address'])}")
     if lead.get("web_presence") == "social" and lead.get("website"):
-        lines.append(f'🔗 <a href="{e(lead["website"])}">Social page only</a>')
+        lines.append(f'🔗 <a href="{e(lead["website"])}">Only a social/booking page</a>')
     if lead.get("notes"):
         lines.append(f"📝 <i>{e(lead['notes'])}</i>")
     lines.append(f"{STATUS_EMOJI[lead['status']]} {lead['status'].capitalize()}")

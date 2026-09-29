@@ -36,13 +36,18 @@ NEW_FIELDS = ",".join([
     "places.primaryTypeDisplayName", "nextPageToken",
 ])
 
-# A "website" on one of these hosts is a social/profile page, not a site the business owns.
-# Those businesses are still great leads (they're active online but have no site).
+# A "website" on one of these hosts is a social, directory or booking-platform profile, not a
+# site the business owns. Those businesses are still great leads (active online, no site).
 SOCIAL_HOSTS = (
     "facebook.com", "fb.com", "fb.me", "instagram.com", "linktr.ee", "wa.me", "whatsapp.com",
     "api.whatsapp.com", "twitter.com", "x.com", "tiktok.com", "linkedin.com", "youtube.com",
     "t.me", "business.site", "g.page", "snapchat.com", "pinterest.com", "yelp.com",
     "bio.link", "beacons.ai", "taplink.cc", "linkin.bio",
+    # booking / listing platforms
+    "booksy.com", "fresha.com", "treatwell.com", "treatwell.co.uk", "treatwell.de", "vagaro.com",
+    "styleseat.com", "setmore.com", "simplybook.me", "calendly.com", "planity.com", "doctolib.fr",
+    "doctolib.de", "znanylekarz.pl", "doctoralia.com", "doctoralia.com.br", "zocdoc.com", "tripadvisor.com",
+    "ubereats.com", "glovoapp.com", "wolt.com",
 )
 
 CLOSED_STATUSES = ("CLOSED_PERMANENTLY", "CLOSED_TEMPORARILY")
@@ -257,6 +262,7 @@ def _search_legacy(query: str, key: str, want: int, keep, region: str = "", lang
 def _search_serper(query: str, key: str, want: int, keep, region: str = "", language: str = "") -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
+    ll = ""  # map viewport from page 1; Serper requires it for page > 1
     for page in range(1, MAX_PAGES + 1):
         body = {"q": query}
         if region:
@@ -264,7 +270,10 @@ def _search_serper(query: str, key: str, want: int, keep, region: str = "", lang
         if language:
             body["hl"] = language
         if page > 1:
+            if not ll:
+                break
             body["page"] = page
+            body["ll"] = ll
         try:
             resp = requests.post(SERPER_API, json=body, timeout=TIMEOUT,
                                  headers={"X-API-KEY": key, "Content-Type": "application/json"})
@@ -276,7 +285,9 @@ def _search_serper(query: str, key: str, want: int, keep, region: str = "", lang
             raise PlacesError("Serper says you're out of credits or rate-limited — check serper.dev dashboard")
         if not resp.ok:
             raise PlacesError(f"Serper error {resp.status_code}: {resp.text[:300]}")
-        found = resp.json().get("places") or []
+        data = resp.json()
+        ll = ll or data.get("ll") or ""
+        found = data.get("places") or []
         new = 0
         for p in found:
             cid = str(p.get("cid") or "")

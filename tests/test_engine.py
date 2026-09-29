@@ -19,6 +19,8 @@ from odify_bot.exports import _csv_safe, generate_csv, generate_vcard
     ("https://linktr.ee/cuts", "social"),
     ("https://wa.me/2348030000000", "social"),
     ("https://cuts.business.site/", "social"),
+    ("https://booksy.com/pl-pl/318722_north-barber", "social"),
+    ("https://www.fresha.com/a/salon-x", "social"),
     ("https://cutsbarbers.com", "website"),
     ("https://notfacebook.com", "website"),
 ])
@@ -197,7 +199,10 @@ def test_serper_parses_filters_and_paginates(monkeypatch, serper):
     def post(url, json, headers, timeout):
         assert url == gp.SERPER_API and headers["X-API-KEY"] == "s-key"
         bodies.append(json)
-        return Resp(200, {"places": pages[json.get("page", 1)]})
+        page = json.get("page", 1)
+        if page > 1:
+            assert json["ll"] == "@52.23,21.01,13z"  # Serper 400s on page > 1 without it
+        return Resp(200, {"places": pages[page], "ll": "@52.23,21.01,13z"})
 
     monkeypatch.setattr(gp.requests, "post", post)
     leads = gp.search_queries(["fryzjer Warszawa"], 10, region="PL", language="pl")
@@ -210,6 +215,18 @@ def test_serper_parses_filters_and_paginates(monkeypatch, serper):
     assert by_id["ChIJ3"]["intl_phone"] == "+48 22 000 00 00"
     assert by_id["ChIJ2"]["web_presence"] == "social"
     assert by_id["ChIJ1"]["maps_url"] == "https://maps.google.com/?cid=1001"
+
+
+def test_serper_stops_paginating_without_viewport(monkeypatch, serper):
+    bodies = []
+
+    def post(url, json, headers, timeout):
+        bodies.append(json)
+        return Resp(200, {"places": [_serper_place(len(bodies))]})  # no "ll" in response
+
+    monkeypatch.setattr(gp.requests, "post", post)
+    gp.search_queries(["fryzjer Warszawa"], 10)
+    assert len(bodies) == 1
 
 
 def test_fan_out_merges_cities_and_survives_one_failure(monkeypatch, serper):

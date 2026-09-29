@@ -7,9 +7,6 @@ from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import phonenumbers
-from phonenumbers import timezone as phone_tz
-
 from . import mockup, outreach, store, web
 
 MAX_FOLLOWUPS = 2
@@ -44,19 +41,8 @@ def due_now(now: datetime, tz: ZoneInfo, at: time, last_sent: str | None) -> boo
     return local.time() >= at and last_sent != local.date().isoformat()
 
 
-def lead_local_time(lead: dict, now: datetime) -> datetime | None:
-    """Their wall-clock time, from the phone number's region."""
-    phone = lead.get("intl_phone") or ""
-    try:
-        zones = [z for z in phone_tz.time_zones_for_number(phonenumbers.parse(phone)) if "/" in z
-                 and not z.startswith("Etc/")]
-        return now.astimezone(ZoneInfo(zones[0])) if zones else None
-    except (phonenumbers.NumberParseException, ZoneInfoNotFoundError, ValueError):
-        return None
-
-
 def timing_hint(lead: dict, now: datetime) -> str:
-    local = lead_local_time(lead, now)
+    local = outreach.lead_local_time(lead, now)
     if local is None:
         return ""
     if 9 <= local.hour < 19:

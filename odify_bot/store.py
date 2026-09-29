@@ -9,7 +9,7 @@ from pathlib import Path
 LEAD_STATUSES = ("new", "contacted", "replied", "won", "lost")
 LEAD_COLUMNS = (
     "place_id", "name", "phone", "intl_phone", "address", "email", "website", "web_presence",
-    "category", "rating", "reviews", "maps_url", "score",
+    "category", "rating", "reviews", "maps_url", "score", "photo_url", "hours", "booking_url",
 )
 
 SCHEMA = """
@@ -100,6 +100,9 @@ def connect():
 MIGRATIONS = {  # (table, column) -> definition; added to databases created before the column existed
     ("leads", "contacted_at"): "TEXT",
     ("leads", "followups"): "INTEGER NOT NULL DEFAULT 0",
+    ("leads", "photo_url"): "TEXT NOT NULL DEFAULT ''",
+    ("leads", "hours"): "TEXT NOT NULL DEFAULT ''",
+    ("leads", "booking_url"): "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -117,6 +120,14 @@ def init_db():
 
 # ---- searches + leads ----
 
+def _column_value(lead: dict, column: str):
+    """Missing text fields become '' (the columns are NOT NULL); rating may stay NULL."""
+    value = lead.get(column)
+    if value is not None or column == "rating":
+        return value
+    return 0 if column in ("reviews", "score") else ""
+
+
 def save_search(niche: str, location: str, requested: int, options: dict, leads: list[dict]) -> int:
     with connect() as conn:
         cur = conn.execute(
@@ -127,7 +138,7 @@ def save_search(niche: str, location: str, requested: int, options: dict, leads:
         conn.executemany(
             f"INSERT INTO leads (search_id, position, {', '.join(LEAD_COLUMNS)})"
             f" VALUES (?, ?, {', '.join('?' * len(LEAD_COLUMNS))})",
-            [(search_id, i, *[lead.get(c) for c in LEAD_COLUMNS]) for i, lead in enumerate(leads)],
+            [(search_id, i, *[_column_value(lead, c) for c in LEAD_COLUMNS]) for i, lead in enumerate(leads)],
         )
         return search_id
 

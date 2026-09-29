@@ -29,6 +29,7 @@ Tap **🎨 Mockup** on any lead to get a one-page website for that business at `
 - **Two-step pitch:** first ask whether they'd like to see it (💬 WhatsApp on the card). When they say yes, tap **Send preview on WhatsApp**.
 - **Open alerts:** once a lead is marked Contacted, the bot pings you when they open their preview (at most every 30 min). WhatsApp and Telegram link-preview bots don't count as opens.
 - **Privacy:** preview links can't be guessed, and pages are `noindex` so search engines don't list them.
+- **What it shows:** their Google photo as the header, opening hours with today highlighted and a live "Open now" badge (in their timezone), a reviews section, and a "Book online" button using their Google booking link. Leads saved before this update have no photo or hours, so their previews fall back to the colour-and-icon header until you search that area again.
 - **Setup:** give the service a public domain (Railway → service → Settings → Networking → Generate Domain, port 8080). Set `MOCKUP_BRAND` to your studio name, and optionally `MOCKUP_BRAND_URL` to link it (e.g. your WhatsApp).
 
 ## Daily digest

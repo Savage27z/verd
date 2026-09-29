@@ -1,6 +1,11 @@
 """Outreach message template + WhatsApp links."""
 import hashlib
+from datetime import datetime
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import phonenumbers
+from phonenumbers import timezone as phone_tz
 
 from . import llm, store
 
@@ -34,6 +39,16 @@ async def template_for_language(language: str) -> str:
     if translated != template:  # don't cache failures; try again next search
         store.set_setting(key, translated)
     return translated
+
+
+def lead_local_time(lead: dict, now: datetime) -> datetime | None:
+    """Their wall-clock time, from the phone number's region."""
+    try:
+        zones = [z for z in phone_tz.time_zones_for_number(phonenumbers.parse(lead.get("intl_phone") or ""))
+                 if "/" in z and not z.startswith("Etc/")]
+        return now.astimezone(ZoneInfo(zones[0])) if zones else None
+    except (phonenumbers.NumberParseException, ZoneInfoNotFoundError, ValueError):
+        return None
 
 
 def lead_language(lead: dict) -> str:

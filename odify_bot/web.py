@@ -59,7 +59,7 @@ def make_handler(on_view: Callable[[dict, int], None] | None):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy",
                              "default-src 'none'; style-src 'unsafe-inline'; frame-src https://maps.google.com "
-                             "https://www.google.com; img-src data:; base-uri 'none'; form-action 'none'")
+                             "https://www.google.com; img-src data: https://*.googleusercontent.com; base-uri 'none'; form-action 'none'")
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(data)

@@ -56,6 +56,95 @@ def test_send_link_uses_local_language():
     assert mockup.send_link(lead(intl_phone="", phone="881 413 419"), "u", "pl") is None
 
 
+# ---- photos, hours, reviews ----
+
+from datetime import datetime, timezone  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+from odify_bot import places  # noqa: E402
+
+PL_HOURS = places.hours_json(list({
+    "wtorek": "10:00–20:00", "środa": "10:00–20:00", "czwartek": "10:00–20:00", "piątek": "10:00–20:00",
+    "sobota": "10:00–15:00", "niedziela": "Zamknięte", "poniedziałek": "10:00–20:00"}.items()))
+TUESDAY_NOON_WARSAW = datetime(2026, 9, 29, 10, 0, tzinfo=timezone.utc)   # 12:00 CEST
+TUESDAY_2AM_WARSAW = datetime(2026, 9, 29, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("10:00–20:00", [(600, 1200)]),
+    ("9 AM–10 PM", [(540, 1320)]),
+    ("12–8 PM", [(720, 1200)]),                      # shared PM
+    ("9:30 AM–1 PM, 2–6 PM", [(570, 780), (840, 1080)]),
+    ("6 PM–2 AM", [(1080, 1560)]),                  # past midnight
+    ("Open 24 hours", [(0, 1440)]),
+    ("Otwarte całą dobę", [(0, 1440)]),
+    ("Zamknięte", []),
+    ("Closed", []),
+])
+def test_parse_intervals(text, expected):
+    assert mockup.parse_intervals(text) == expected
+
+
+def test_weekdays_in_any_language():
+    assert [mockup.weekday_index(d) for d in ("Wtorek", "Tuesday", "Dienstag", "Segunda-feira", "lunedì")] == [1, 1, 1, 0, 0]
+    assert mockup.weekday_index("Holiday") is None
+
+
+def test_hours_sorted_monday_first_with_open_badge():
+    pairs = mockup.load_hours({"hours": PL_HOURS})
+    assert [d for d, _ in pairs][:2] == ["poniedziałek", "wtorek"]
+    warsaw = TUESDAY_NOON_WARSAW.astimezone(ZoneInfo("Europe/Warsaw"))
+    assert mockup.open_status(pairs, warsaw) == (1, True, "20:00")
+    assert mockup.load_hours({"hours": "not json"}) == []
+
+
+def test_large_photo_url():
+    assert places.large_photo_url("https://lh3.googleusercontent.com/gps-cs-s/ABC") == \
+        "https://lh3.googleusercontent.com/gps-cs-s/ABC=w1600-h900-p-k-no"
+    assert places.large_photo_url("https://lh5.googleusercontent.com/p/XYZ=w80-h106-k-no") == \
+        "https://lh5.googleusercontent.com/p/XYZ=w1600-h900-p-k-no"
+    assert places.large_photo_url("https://example.com/a.jpg") == "https://example.com/a.jpg"
+
+
+def test_render_with_photo_hours_reviews_and_booking():
+    rich = lead(photo_url="https://lh3.googleusercontent.com/gps-cs-s/ABC=w1600-h900-p-k-no", hours=PL_HOURS,
+                booking_url="https://northbarberkrk.booksy.com/a/", website="https://instagram.com/north")
+    page = mockup.render(rich, "pl", now=TUESDAY_NOON_WARSAW)
+    assert 'class="photo"' in page and "url('https://lh3.googleusercontent.com/gps-cs-s/ABC=w1600-h900-p-k-no')" in page
+    assert "💈" not in page  # the photo replaces the emoji
+    assert "Godziny otwarcia" in page and "Wtorek · Dziś" in page and "Otwarte · do 20:00" in page
+    assert "Co mówią klienci" in page and "312" not in page and "156 opinii w Google" in page
+    assert 'href="https://northbarberkrk.booksy.com/a/"' in page  # Google's booking link wins over Instagram
+    night = mockup.render(rich, "pl", now=TUESDAY_2AM_WARSAW)
+    assert "Teraz zamknięte" in night
+
+
+def test_render_rejects_suspicious_photo_urls():
+    page = mockup.render(lead(photo_url="javascript:alert(1)"), "en")
+    assert "javascript:" not in page and 'class="photo"' not in page
+    page = mockup.render(lead(photo_url="https://x.googleusercontent.com/a');}body{background:red"), "en")
+    assert "background:red" not in page
+
+
+def test_serper_captures_photo_hours_and_booking(monkeypatch):
+    monkeypatch.setenv("SERPER_API_KEY", "k")
+    monkeypatch.delenv("GOOGLE_PLACES_API_KEY", raising=False)
+    monkeypatch.delenv("PLACES_PROVIDER", raising=False)
+    monkeypatch.setattr(places, "find_business_email", lambda *a, **k: "")
+    place = {"title": "North", "placeId": "ChIJ1", "cid": "1", "phoneNumber": "+48 791 711 671", "rating": 4.9,
+             "ratingCount": 312, "thumbnailUrl": "https://lh3.googleusercontent.com/gps-cs-s/ABC",
+             "openingHours": {"wtorek": "10:00–20:00", "niedziela": "Zamknięte"},
+             "bookingLinks": ["https://northbarberkrk.booksy.com/a/", "https://booksy.com/x"]}
+    monkeypatch.setattr(places.requests, "post", lambda *a, **k: SimpleNamespace(
+        status_code=200, ok=True, json=lambda: {"places": [place]}, text=""))
+    [found] = places.search_queries(["fryzjer Kraków"], 5, region="PL", language="pl")
+    assert found["photo_url"].endswith("=w1600-h900-p-k-no")
+    assert found["booking_url"] == "https://northbarberkrk.booksy.com/a/"
+    assert mockup.load_hours(found) == [("wtorek", "10:00–20:00"), ("niedziela", "Zamknięte")]
+    sid = store.save_search("barbers", "Kraków", 1, {"language": "pl"}, [found])
+    assert store.get_leads(sid)[0]["booking_url"] == "https://northbarberkrk.booksy.com/a/"
+
+
 # ---- storage ----
 
 def test_mockup_token_is_stable_and_views_are_throttled():

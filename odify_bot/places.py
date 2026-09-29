@@ -8,9 +8,11 @@ Two providers, picked by PLACES_PROVIDER (or whichever key is set):
 * serper — serper.dev's Google Maps endpoint. No Google Cloud account or card needed;
   ~20 places per request, same fields.
 """
+import json
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +35,7 @@ NEW_FIELDS = ",".join([
     "places.id", "places.displayName", "places.formattedAddress", "places.websiteUri",
     "places.nationalPhoneNumber", "places.internationalPhoneNumber", "places.rating",
     "places.userRatingCount", "places.googleMapsUri", "places.businessStatus",
-    "places.primaryTypeDisplayName", "nextPageToken",
+    "places.primaryTypeDisplayName", "places.regularOpeningHours.weekdayDescriptions", "nextPageToken",
 ])
 
 # A "website" on one of these hosts is a social, directory or booking-platform profile, not a
@@ -132,11 +134,29 @@ def lead_score(lead: dict) -> int:
     return int(max(0, min(100, round(score))))
 
 
+def large_photo_url(url: str) -> str:
+    """Google photo links default to a ~340px thumbnail; ask for a 1600x900 smart crop instead."""
+    if not url or "googleusercontent.com" not in url:
+        return url or ""
+    return re.sub(r"=[a-z0-9-]+$", "", url, flags=re.IGNORECASE) + "=w1600-h900-p-k-no"
+
+
+def hours_json(pairs: list[tuple[str, str]]) -> str:
+    """Opening hours as a JSON list of [day, text] in the order Google gave them."""
+    pairs = [(str(d).strip(), str(t).strip()) for d, t in pairs if str(d).strip()]
+    return json.dumps(pairs, ensure_ascii=False) if pairs else ""
+
+
+def _weekday_descriptions(lines: list[str]) -> list[tuple[str, str]]:
+    """Google's 'Monday: 9:00 AM – 5:00 PM' lines -> [('Monday', '9:00 AM – 5:00 PM'), ...]."""
+    return [tuple(x.strip() for x in line.split(":", 1)) for line in lines if ":" in line]
+
+
 def _lead(**kw) -> dict:
     base = {
         "place_id": "", "name": "", "phone": "", "intl_phone": "", "address": "", "email": "",
         "website": "", "web_presence": "none", "category": "", "rating": None, "reviews": 0,
-        "maps_url": "",
+        "maps_url": "", "photo_url": "", "hours": "", "booking_url": "",
     }
     base.update({k: v for k, v in kw.items() if v is not None})
     return base
@@ -187,6 +207,8 @@ def _search_new(query: str, key: str, want: int, keep, region: str = "", languag
                 rating=p.get("rating"),
                 reviews=p.get("userRatingCount", 0),
                 maps_url=p.get("googleMapsUri", ""),
+                hours=hours_json(_weekday_descriptions(
+                    (p.get("regularOpeningHours") or {}).get("weekdayDescriptions") or [])),
             )
             if keep(lead):
                 out.append(lead)
@@ -310,6 +332,10 @@ def _search_serper(query: str, key: str, want: int, keep, region: str = "", lang
                 rating=p.get("rating"),
                 reviews=p.get("ratingCount") or 0,
                 maps_url=f"https://maps.google.com/?cid={cid}" if cid else "",
+                photo_url=large_photo_url(p.get("thumbnailUrl") or ""),
+                hours=hours_json(list((p.get("openingHours") or {}).items())),
+                booking_url=next((u for u in p.get("bookingLinks") or [] if isinstance(u, str)
+                                  and u.startswith("https://")), ""),
             )
             if keep(lead):
                 out.append(lead)

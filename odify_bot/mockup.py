@@ -1,8 +1,9 @@
 """One-page website previews for leads — built from lead data only (no LLM, no external assets)."""
 import hashlib
 import html
+import json
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from urllib.parse import quote, urlparse
 
 from . import outreach
@@ -112,8 +113,112 @@ BOOKING_HOSTS = ("booksy.", "fresha.", "treatwell.", "vagaro.", "styleseat.", "s
                  "calendly.", "planity.", "doctolib.", "znanylekarz.", "doctoralia.", "zocdoc.")
 
 
+# Opening-hours and reviews sections.
+SECTION_STRINGS = {
+    "en": {"hours": "Opening hours", "today": "Today", "open_now": "Open now · until {time}",
+           "closed_now": "Closed now", "reviews_title": "What customers say",
+           "reviews_count": "{reviews} reviews on Google", "reviews_button": "Read reviews on Google"},
+    "pl": {"hours": "Godziny otwarcia", "today": "Dziś", "open_now": "Otwarte · do {time}",
+           "closed_now": "Teraz zamknięte", "reviews_title": "Co mówią klienci",
+           "reviews_count": "{reviews} opinii w Google", "reviews_button": "Zobacz opinie w Google"},
+    "de": {"hours": "Öffnungszeiten", "today": "Heute", "open_now": "Jetzt geöffnet · bis {time}",
+           "closed_now": "Jetzt geschlossen", "reviews_title": "Das sagen unsere Kunden",
+           "reviews_count": "{reviews} Bewertungen auf Google", "reviews_button": "Bewertungen auf Google lesen"},
+    "es": {"hours": "Horario", "today": "Hoy", "open_now": "Abierto ahora · hasta las {time}",
+           "closed_now": "Cerrado ahora", "reviews_title": "Lo que dicen nuestros clientes",
+           "reviews_count": "{reviews} reseñas en Google", "reviews_button": "Leer reseñas en Google"},
+    "pt": {"hours": "Horário de funcionamento", "today": "Hoje", "open_now": "Aberto agora · até {time}",
+           "closed_now": "Fechado agora", "reviews_title": "O que dizem nossos clientes",
+           "reviews_count": "{reviews} avaliações no Google", "reviews_button": "Ver avaliações no Google"},
+    "fr": {"hours": "Horaires", "today": "Aujourd'hui", "open_now": "Ouvert · jusqu'à {time}",
+           "closed_now": "Fermé actuellement", "reviews_title": "L'avis de nos clients",
+           "reviews_count": "{reviews} avis sur Google", "reviews_button": "Lire les avis sur Google"},
+    "it": {"hours": "Orari di apertura", "today": "Oggi", "open_now": "Aperto ora · fino alle {time}",
+           "closed_now": "Chiuso ora", "reviews_title": "Cosa dicono i clienti",
+           "reviews_count": "{reviews} recensioni su Google", "reviews_button": "Leggi le recensioni su Google"},
+    "nl": {"hours": "Openingstijden", "today": "Vandaag", "open_now": "Nu open · tot {time}",
+           "closed_now": "Nu gesloten", "reviews_title": "Wat klanten zeggen",
+           "reviews_count": "{reviews} reviews op Google", "reviews_button": "Lees reviews op Google"},
+}
+
+# Monday..Sunday, lowercase, as Google writes them in each language.
+WEEKDAYS = {
+    "en": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+    "pl": ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"],
+    "de": ["montag", "dienstag", "mittwoch", "donnerstag", "freitag", "samstag", "sonntag"],
+    "es": ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"],
+    "pt": ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"],
+    "fr": ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"],
+    "it": ["lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica"],
+    "nl": ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"],
+}
+
+_TIME = r"(\d{1,2})(?:[:.](\d{2}))?\s*([AaPp]\.?[Mm]\.?)?"
+_RANGE = re.compile(_TIME + r"\s*[–—-]\s*" + _TIME)
+_ALL_DAY = re.compile(r"24\s*(hours|h\b|godz|stunden|horas|heures|ore|uur)|całą dobę|24/7", re.IGNORECASE)
+
+
 def strings(language: str) -> dict:
-    return {**STRINGS["en"], **STRINGS.get((language or "en").lower(), {})}
+    lang = (language or "en").lower()
+    return {**STRINGS["en"], **SECTION_STRINGS["en"], **STRINGS.get(lang, {}), **SECTION_STRINGS.get(lang, {})}
+
+
+def weekday_index(day: str) -> int | None:
+    """'Wtorek' / 'Tuesday' / 'segunda' -> 0..6 (Monday=0), in any supported language."""
+    d = day.strip().lower().rstrip(":")
+    if not d:
+        return None
+    for names in WEEKDAYS.values():
+        for i, name in enumerate(names):
+            if name == d or name.startswith(d) or d.startswith(name):
+                return i
+    return None
+
+
+def parse_intervals(text: str) -> list[tuple[int, int]]:
+    """Opening ranges in minutes since midnight. [] = closed that day.
+    Handles '10:00–20:00', '9 AM–10 PM', '12–8 PM' (shared AM/PM), split shifts, '24 hours'."""
+    if _ALL_DAY.search(text):
+        return [(0, 24 * 60)]
+    out = []
+    for h1, m1, s1, h2, m2, s2 in _RANGE.findall(text):
+        s1 = s1 or s2  # "12–8 PM": the start takes the end's AM/PM
+
+        def minutes(h: str, m: str, suffix: str) -> int:
+            hour = int(h) % 24
+            if suffix:
+                hour = hour % 12 + (12 if suffix.lower().startswith("p") else 0)
+            return hour * 60 + int(m or 0)
+
+        start, end = minutes(h1, m1, s1), minutes(h2, m2, s2)
+        if end <= start:
+            end += 24 * 60  # past midnight
+        out.append((start, end))
+    return out
+
+
+def load_hours(lead: dict) -> list[tuple[str, str]]:
+    """Stored hours as [(day, text)], Monday first when the day names are recognised."""
+    try:
+        pairs = [(str(d), str(t)) for d, t in json.loads(lead.get("hours") or "[]")]
+    except (ValueError, TypeError):
+        return []
+    idx = [weekday_index(d) for d, _ in pairs]
+    if None not in idx and len(set(idx)) == len(idx):
+        pairs = [p for _, p in sorted(zip(idx, pairs))]
+    return pairs
+
+
+def open_status(pairs: list[tuple[str, str]], local: datetime) -> tuple[int | None, bool, str]:
+    """(index of today's row, open now?, closing time 'HH:MM')."""
+    today = next((i for i, (d, _) in enumerate(pairs) if weekday_index(d) == local.weekday()), None)
+    if today is None:
+        return None, False, ""
+    now = local.hour * 60 + local.minute
+    for start, end in parse_intervals(pairs[today][1]):
+        if start <= now < end:
+            return today, True, "24:00" if end - start >= 24 * 60 else f"{end // 60 % 24:02d}:{end % 60:02d}"
+    return today, False, ""
 
 
 def icon_for(lead: dict) -> str:
@@ -164,9 +269,11 @@ def send_link(lead: dict, url: str, language: str) -> str | None:
     return f"https://wa.me/{n}?text={quote(send_text(lead, url, language))}" if n else None
 
 
-def render(lead: dict, language: str = "en", brand: str = "Odify", brand_url: str = "", fallback_city: str = "") -> str:
+def render(lead: dict, language: str = "en", brand: str = "Odify", brand_url: str = "", fallback_city: str = "",
+           now: datetime | None = None) -> str:
     t = strings(language)
     e = html.escape
+    now = now or datetime.now(timezone.utc)
     name = lead.get("name") or "Your business"
     city = city_from_address(lead.get("address", ""), fallback_city)
     rating, reviews = lead.get("rating"), int(lead.get("reviews") or 0)
@@ -176,8 +283,13 @@ def render(lead: dict, language: str = "en", brand: str = "Odify", brand_url: st
     wa = outreach.whatsapp_number(lead)
     wa_url = f"https://wa.me/{wa}" if wa else ""
     kind = link_kind(lead.get("website", "")) if lead.get("web_presence") == "social" else None
+    # A booking link from Google beats a generic social link for the "Book online" button.
+    book_url = lead.get("booking_url") or (lead.get("website") if kind == "book" else "")
+    follow_url = lead.get("website") if kind == "follow" else ""
     maps_url = lead.get("maps_url") or f"https://www.google.com/maps/search/?api=1&query={quote(name + ' ' + lead.get('address', ''))}"
     embed = f"https://maps.google.com/maps?q={quote(name + ', ' + lead.get('address', ''))}&output=embed"
+    photo = lead.get("photo_url") or ""
+    photo = photo if photo.startswith("https://") and not re.search(r"[\"'()\\\s]", photo) else ""
     fmt = {"name": name, "brand": brand, "city": city or "", "rating": rating, "reviews": reviews}
 
     buttons = []
@@ -185,21 +297,66 @@ def render(lead: dict, language: str = "en", brand: str = "Odify", brand_url: st
         buttons.append(f'<a class="btn primary" href="{e(tel)}">📞 {e(t["call"])}</a>')
     if wa_url:
         buttons.append(f'<a class="btn wa" href="{e(wa_url)}">💬 {e(t["whatsapp"])}</a>')
-    if kind:
-        buttons.append(f'<a class="btn ghost" href="{e(lead["website"])}" rel="noopener">'
-                       f'{"📅" if kind == "book" else "📱"} {e(t[kind])}</a>')
+    if book_url:
+        buttons.append(f'<a class="btn ghost" href="{e(book_url)}" rel="noopener">📅 {e(t["book"])}</a>')
+    elif follow_url:
+        buttons.append(f'<a class="btn ghost" href="{e(follow_url)}" rel="noopener">📱 {e(t["follow"])}</a>')
     buttons.append(f'<a class="btn ghost" href="{e(maps_url)}" rel="noopener">📍 {e(t["directions"])}</a>')
 
-    rating_html = ""
+    stars = ""
     if rating:
-        stars = "★" * int(round(float(rating))) + "☆" * (5 - int(round(float(rating))))
-        rating_html = (f'<div class="rating"><span class="stars">{stars}</span> '
-                       f'{e(t["reviews"].format(**fmt))}</div>')
+        full = int(round(float(rating)))
+        stars = "★" * full + "☆" * (5 - full)
+    rating_html = (f'<div class="rating"><span class="stars">{stars}</span> {e(t["reviews"].format(**fmt))}</div>'
+                   if rating else "")
+
+    # Opening hours, with today's row highlighted and a live open/closed badge in *their* timezone.
+    pairs = load_hours(lead)
+    hours_html, badge_html = "", ""
+    if pairs:
+        local = outreach.lead_local_time(lead, now) or now
+        today, is_open, closes = open_status(pairs, local)
+        rows = "".join(
+            f'<tr class="{"today" if i == today else ""}"><th>{e(day.capitalize())}'
+            f'{" · " + e(t["today"]) if i == today else ""}</th><td>{e(text)}</td></tr>'
+            for i, (day, text) in enumerate(pairs))
+        hours_html = f'<section><h2>{e(t["hours"])}</h2><table class="hours">{rows}</table></section>'
+        if today is not None:
+            badge_html = (f'<div class="badge open">● {e(t["open_now"].format(time=closes))}</div>' if is_open
+                          else f'<div class="badge closed">● {e(t["closed_now"])}</div>')
+
+    reviews_html = ""
+    if rating and reviews:
+        score = f"{float(rating):.1f}"
+        reviews_html = (
+            f'<section class="reviews"><h2>{e(t["reviews_title"])}</h2>'
+            f'<div class="score"><span class="big">{e(score)}</span>'
+            f'<div><div class="stars lg">{stars}</div><div>{e(t["reviews_count"].format(**fmt))}</div></div></div>'
+            f'<a class="btn outline" href="{e(maps_url)}" rel="noopener">⭐ {e(t["reviews_button"])}</a></section>')
+
     about = (t["about"] if reviews >= 5 else t["about_new"]).format(**fmt) if city else ""
     sub = " · ".join(x for x in (lead.get("category") or "", city) if x)
     brand_html = f'<a href="{e(brand_url)}">{e(brand)}</a>' if brand_url else e(brand)
     banner = _link_last(t["banner"].format(**fmt), brand, brand_html)
     footer = _link_last(t["footer"].format(**fmt), brand, brand_html)
+    header_class = "photo" if photo else ""
+    # Single quotes: this goes inside style="…" (the URL was already checked for quotes/brackets).
+    header_bg = (f"background: linear-gradient(180deg, rgba(15,23,42,.35), rgba(15,23,42,.8)), url('{e(photo)}') "
+                 f"center / cover no-repeat, var(--d);" if photo else "")
+    icon_html = "" if photo else f'<div class="icon">{icon_for(lead)}</div>'
+    og_image = f'<meta property="og:image" content="{e(photo)}">' if photo else ""
+    welcome_html = f'<section><h2>{e(t["welcome"])}</h2><p>{e(about)}</p></section>' if about else ""
+    contact_links = "".join([
+        f'<a href="{e(tel)}">📞 {e(phone)}</a>' if tel else "",
+        f'<a href="{e(wa_url)}">💬 WhatsApp</a>' if wa_url else "",
+        f'<a href="mailto:{e(lead["email"])}">✉️ {e(lead["email"])}</a>' if lead.get("email") else "",
+        f'<a href="{e(book_url)}" rel="noopener">📅 {e(t["book"])}</a>' if book_url else "",
+        f'<a href="{e(follow_url)}" rel="noopener">🔗 {e(t["follow"])}</a>' if follow_url else "",
+    ])
+    sticky = "".join([
+        f'<a class="btn primary" href="{e(tel)}">📞 {e(t["call"])}</a>' if tel else "",
+        f'<a class="btn wa" href="{e(wa_url)}">💬 {e(t["whatsapp"])}</a>' if wa_url else "",
+    ])
 
     return f"""<!doctype html>
 <html lang="{e(language or 'en')}">
@@ -210,6 +367,7 @@ def render(lead: dict, language: str = "en", brand: str = "Odify", brand_url: st
 <title>{e(name)}</title>
 <meta property="og:title" content="{e(name)}">
 <meta property="og:description" content="{e(sub)}">
+{og_image}
 <style>
 :root {{ --p: {primary}; --d: {deep}; }}
 * {{ box-sizing: border-box; }}
@@ -218,19 +376,31 @@ a {{ color: inherit; }}
 .banner {{ background: #111827; color: #f9fafb; text-align: center; font-size: 13px; padding: 8px 16px; }}
 .banner a {{ color: #fbbf24; }}
 header {{ background: linear-gradient(135deg, var(--p), var(--d)); color: #fff; padding: 56px 20px 64px; text-align: center; }}
+header.photo {{ min-height: 70vh; display: flex; flex-direction: column; justify-content: flex-end; padding-top: 120px; text-shadow: 0 2px 12px rgba(0,0,0,.45); }}
 .icon {{ font-size: 56px; line-height: 1; }}
-h1 {{ font-size: clamp(30px, 7vw, 48px); line-height: 1.15; margin: 14px auto 6px; max-width: 760px; overflow-wrap: anywhere; }}
-.sub {{ opacity: .9; font-size: 18px; }}
-.rating {{ display: inline-block; margin-top: 16px; background: rgba(255,255,255,.15); border-radius: 999px; padding: 6px 14px; font-size: 15px; }}
+h1 {{ font-size: clamp(30px, 7vw, 52px); line-height: 1.12; margin: 14px auto 6px; max-width: 760px; overflow-wrap: anywhere; }}
+.sub {{ opacity: .92; font-size: 18px; }}
+.rating, .badge {{ display: inline-block; margin: 14px 4px 0; background: rgba(255,255,255,.16); backdrop-filter: blur(6px); border-radius: 999px; padding: 6px 14px; font-size: 15px; text-shadow: none; }}
+.badge.open {{ color: #bbf7d0; }}
+.badge.closed {{ color: #fecaca; }}
 .stars {{ color: #fbbf24; letter-spacing: 1px; }}
-.cta {{ display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-top: 26px; }}
+.cta {{ display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-top: 26px; text-shadow: none; }}
 .btn {{ display: inline-block; text-decoration: none; font-weight: 600; padding: 12px 20px; border-radius: 12px; }}
 .btn.primary {{ background: #fff; color: var(--d); }}
 .btn.wa {{ background: #22c55e; color: #fff; }}
-.btn.ghost {{ border: 1.5px solid rgba(255,255,255,.7); color: #fff; }}
-main {{ max-width: 860px; margin: -28px auto 0; padding: 0 16px 40px; }}
+.btn.ghost {{ border: 1.5px solid rgba(255,255,255,.75); color: #fff; background: rgba(15,23,42,.2); }}
+.btn.outline {{ border: 1.5px solid var(--p); color: var(--p); margin-top: 14px; }}
+main {{ max-width: 860px; margin: -28px auto 0; padding: 0 16px 40px; position: relative; }}
 section {{ background: #fff; border-radius: 16px; box-shadow: 0 6px 24px rgba(15,23,42,.06); padding: 26px; margin-bottom: 18px; }}
-h2 {{ margin: 0 0 10px; font-size: 22px; color: var(--d); }}
+h2 {{ margin: 0 0 12px; font-size: 22px; color: var(--d); }}
+.hours {{ width: 100%; border-collapse: collapse; }}
+.hours th, .hours td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #f1f5f9; font-weight: 500; }}
+.hours td {{ text-align: right; color: #475569; }}
+.hours tr.today {{ background: #f0fdf4; }}
+.hours tr.today th, .hours tr.today td {{ font-weight: 700; color: #14532d; }}
+.score {{ display: flex; align-items: center; gap: 16px; }}
+.score .big {{ font-size: 56px; font-weight: 800; color: var(--d); line-height: 1; }}
+.stars.lg {{ font-size: 24px; }}
 .map {{ width: 100%; height: 300px; border: 0; border-radius: 12px; margin-top: 10px; }}
 .contact a {{ display: block; margin: 6px 0; font-weight: 600; color: var(--p); text-decoration: none; overflow-wrap: anywhere; }}
 footer {{ text-align: center; color: #6b7280; font-size: 13px; padding: 10px 16px 90px; }}
@@ -242,15 +412,17 @@ footer {{ text-align: center; color: #6b7280; font-size: 13px; padding: 10px 16p
 </head>
 <body>
 <div class="banner">{banner}</div>
-<header>
-  <div class="icon">{icon_for(lead)}</div>
+<header class="{header_class}" style="{header_bg}">
+  {icon_html}
   <h1>{e(name)}</h1>
   <div class="sub">{e(sub)}</div>
-  {rating_html}
+  <div>{rating_html}{badge_html}</div>
   <div class="cta">{"".join(buttons)}</div>
 </header>
 <main>
-  {f'<section><h2>{e(t["welcome"])}</h2><p>{e(about)}</p></section>' if about else ""}
+  {welcome_html}
+  {reviews_html}
+  {hours_html}
   <section>
     <h2>{e(t["find"])}</h2>
     <p>{e(lead.get("address") or city)}</p>
@@ -258,16 +430,10 @@ footer {{ text-align: center; color: #6b7280; font-size: 13px; padding: 10px 16p
   </section>
   <section class="contact">
     <h2>{e(t["contact"])}</h2>
-    {f'<a href="{e(tel)}">📞 {e(phone)}</a>' if tel else ""}
-    {f'<a href="{e(wa_url)}">💬 WhatsApp</a>' if wa_url else ""}
-    {f'<a href="mailto:{e(lead["email"])}">✉️ {e(lead["email"])}</a>' if lead.get("email") else ""}
-    {f'<a href="{e(lead["website"])}" rel="noopener">🔗 {e(t[kind])}</a>' if kind else ""}
+    {contact_links}
   </section>
 </main>
 <footer>© {date.today().year} {e(name)} · {footer}</footer>
-<div class="sticky">
-  {f'<a class="btn primary" href="{e(tel)}">📞 {e(t["call"])}</a>' if tel else ""}
-  {f'<a class="btn wa" href="{e(wa_url)}">💬 {e(t["whatsapp"])}</a>' if wa_url else ""}
-</div>
+<div class="sticky">{sticky}</div>
 </body>
 </html>"""

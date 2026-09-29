@@ -1,6 +1,7 @@
 """SQLite storage: searches, leads (with pipeline status + notes), settings."""
 import json
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -52,6 +53,15 @@ CREATE TABLE IF NOT EXISTS lead_messages (
     message_id INTEGER NOT NULL,
     lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
     PRIMARY KEY (chat_id, message_id)
+);
+-- Website previews: an unguessable token per lead, plus who's been looking.
+CREATE TABLE IF NOT EXISTS mockups (
+    token TEXT PRIMARY KEY,
+    lead_id INTEGER NOT NULL UNIQUE REFERENCES leads(id) ON DELETE CASCADE,
+    views INTEGER NOT NULL DEFAULT 0,
+    last_view_at TEXT,
+    notified_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -189,6 +199,56 @@ def lead_for_message(chat_id: int, message_id: int) -> int | None:
             "SELECT lead_id FROM lead_messages WHERE chat_id=? AND message_id=?", (chat_id, message_id)
         ).fetchone()
         return row["lead_id"] if row else None
+
+
+# ---- website previews ----
+
+def mockup_token(lead_id: int) -> str:
+    """The lead's preview token, created on first use (stable afterwards)."""
+    with connect() as conn:
+        row = conn.execute("SELECT token FROM mockups WHERE lead_id=?", (lead_id,)).fetchone()
+        if row:
+            return row["token"]
+        token = secrets.token_urlsafe(9)
+        conn.execute("INSERT INTO mockups (token, lead_id) VALUES (?, ?)", (token, lead_id))
+        return token
+
+
+def mockup_by_token(token: str) -> tuple[dict, dict] | None:
+    """(lead, search) for a token, or None."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT l.*, s.options AS search_options, s.location AS search_location FROM mockups m"
+            " JOIN leads l ON l.id = m.lead_id JOIN searches s ON s.id = l.search_id WHERE m.token=?",
+            (token,),
+        ).fetchone()
+    if not row:
+        return None
+    lead = dict(row)
+    search = {"options": json.loads(lead.pop("search_options") or "{}"), "location": lead.pop("search_location")}
+    return lead, search
+
+
+def record_view(token: str, notify_every_minutes: int = 30) -> tuple[int, bool]:
+    """Count a view. Returns (total views, whether to notify the owner now — at most once per
+    `notify_every_minutes`, so a lead scrolling around doesn't spam you)."""
+    with connect() as conn:
+        conn.execute("UPDATE mockups SET views = views + 1, last_view_at = datetime('now') WHERE token=?", (token,))
+        row = conn.execute(
+            "SELECT views, notified_at IS NULL OR notified_at < datetime('now', ?) AS due FROM mockups WHERE token=?",
+            (f"-{notify_every_minutes} minutes", token),
+        ).fetchone()
+        if not row:
+            return 0, False
+        if row["due"]:
+            conn.execute("UPDATE mockups SET notified_at = datetime('now') WHERE token=?", (token,))
+        return row["views"], bool(row["due"])
+
+
+def mockup_views(lead_id: int) -> int:
+    with connect() as conn:
+        row = conn.execute("SELECT views FROM mockups WHERE lead_id=?", (lead_id,)).fetchone()
+        return row["views"] if row else 0
 
 
 # ---- settings ----

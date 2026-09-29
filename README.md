@@ -22,6 +22,15 @@ It then does the following:
 
 Built on the lead engine from [callmidavid/odify](https://github.com/callmidavid/odify), with the pricing, accounts and web app removed.
 
+## Website previews (🎨 Mockup)
+
+Tap **🎨 Mockup** on any lead to get a one-page website for that business at `https://<your-domain>/m/<random-code>`. It includes their name, rating and reviews, call/WhatsApp/booking buttons, a map and contact details, with its fixed text in the lead's language (en, pl, de, es, pt, fr, it, nl; others fall back to English). The page is built from the lead's data with **no LLM**, and the bot serves it itself.
+
+- **Two-step pitch:** first ask whether they'd like to see it (💬 WhatsApp on the card). When they say yes, tap **Send preview on WhatsApp**.
+- **Open alerts:** once a lead is marked Contacted, the bot pings you when they open their preview (at most every 30 min). WhatsApp and Telegram link-preview bots don't count as opens.
+- **Privacy:** preview links can't be guessed, and pages are `noindex` so search engines don't list them.
+- **Setup:** give the service a public domain (Railway → service → Settings → Networking → Generate Domain, port 8080). Set `MOCKUP_BRAND` to your studio name, and optionally `MOCKUP_BRAND_URL` to link it (e.g. your WhatsApp).
+
 ## Setup
 
 You need three keys:

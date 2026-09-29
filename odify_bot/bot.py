@@ -14,7 +14,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
-from . import exports, llm, outreach, places, store
+from . import exports, llm, mockup, outreach, places, store, web
 
 log = logging.getLogger("odify.bot")
 
@@ -41,6 +41,7 @@ Leads you already have are skipped unless you ask for them again.
 • Tap a status under a lead (Contacted / Replied / Won / Lost)
 • <b>Reply</b> to a lead card with text to save a note
 • 💬 WhatsApp opens a chat with your pitch pre-filled
+• 🎨 Mockup builds them a free one-page website preview to send — you get pinged when they open it
 
 /leads — recent searches
 /pipeline — leads by status
@@ -146,23 +147,48 @@ def lead_card(lead: dict) -> str:
         lines.append(f'🔗 <a href="{e(lead["website"])}">Only a social/booking page</a>')
     if lead.get("notes"):
         lines.append(f"📝 <i>{e(lead['notes'])}</i>")
+    views = store.mockup_views(lead["id"]) if lead.get("id") else 0
+    if views:
+        lines.append(f"👀 Opened their website preview {views}×")
     lines.append(f"{STATUS_EMOJI[lead['status']]} {lead['status'].capitalize()}")
     return "\n".join(lines)
 
 
 def lead_keyboard(lead: dict, pitch: str | None = None) -> InlineKeyboardMarkup:
-    row1 = []
+    row1, row2 = [], []
     wa = outreach.whatsapp_link(lead, pitch or pitch_for(lead))
     if wa:
         row1.append(InlineKeyboardButton("💬 WhatsApp", url=wa))
+    row1.append(InlineKeyboardButton("🎨 Mockup", callback_data=f"mk:{lead['id']}"))
     if lead.get("maps_url"):
-        row1.append(InlineKeyboardButton("🗺 Maps", url=lead["maps_url"]))
-    row1.append(InlineKeyboardButton("👤 Contact", callback_data=f"vc:{lead['id']}"))
+        row2.append(InlineKeyboardButton("🗺 Maps", url=lead["maps_url"]))
+    row2.append(InlineKeyboardButton("👤 Contact", callback_data=f"vc:{lead['id']}"))
     statuses = [
         InlineKeyboardButton(("✓ " if lead["status"] == s else "") + s.capitalize(), callback_data=f"st:{lead['id']}:{s}")
         for s in ("contacted", "replied", "won", "lost")
     ]
-    return InlineKeyboardMarkup([row1, statuses[:2], statuses[2:]])
+    return InlineKeyboardMarkup([row1, row2, statuses[:2], statuses[2:]])
+
+
+def search_language(lead: dict) -> str:
+    search = store.get_search(lead["search_id"]) if lead.get("search_id") else None
+    return (search or {}).get("options", {}).get("language") or "en"
+
+
+async def send_mockup(chat_id: int, lead: dict, context: ContextTypes.DEFAULT_TYPE):
+    url = web.preview_url(store.mockup_token(lead["id"]))
+    lang = search_language(lead)
+    buttons = [[InlineKeyboardButton("🌐 Open preview", url=url)]]
+    send = mockup.send_link(lead, url, lang)
+    if send:
+        buttons.append([InlineKeyboardButton("💬 Send preview on WhatsApp", url=send)])
+    await context.bot.send_message(
+        chat_id,
+        f"🎨 <b>Website preview for {e(lead['name'])}</b>\n{e(url)}\n\n"
+        "Ask first (💬 WhatsApp on the lead card); once they say yes, tap <b>Send preview</b>. "
+        "I'll tell you when they open it.",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons), disable_web_page_preview=True,
+    )
 
 
 def search_summary(search: dict, leads: list[dict]) -> str:
@@ -428,6 +454,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if lead:
             await context.bot.send_document(chat_id, exports.generate_vcard(lead).encode(),
                                             filename=f"{slugify(lead['name'])}.vcf")
+    elif kind == "mk":
+        lead = store.get_lead(int(rest))
+        if not lead:
+            await query.answer("Lead not found")
+        elif not web.public_base_url():
+            await query.answer("Previews need a public URL: generate a domain for this service on Railway "
+                               "(or set PUBLIC_URL), then try again.", show_alert=True)
+        else:
+            await query.answer()
+            await send_mockup(chat_id, lead, context)
     elif kind in ("csv", "vcf"):
         search = store.get_search(int(rest))
         await query.answer()
@@ -465,6 +501,19 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled error", exc_info=context.error)
 
 
+async def notify_view(app: Application, lead: dict, views: int):
+    """A lead opened their preview. Only worth a ping once you've actually contacted them —
+    before that, the opens are you checking the page."""
+    log.info("Preview opened: lead %s %r (view %d, status %s)", lead["id"], lead["name"], views, lead["status"])
+    if lead["status"] == "new":
+        return
+    for uid in allowed_ids():
+        await app.bot.send_message(
+            uid, f"👀 <b>{e(lead['name'])}</b> just opened their website preview (view {views}). "
+                 "Good moment to follow up!",
+            parse_mode=ParseMode.HTML, reply_markup=lead_keyboard(lead), disable_web_page_preview=True)
+
+
 async def _post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("leads", "Recent searches"),
@@ -473,6 +522,15 @@ async def _post_init(app: Application):
         BotCommand("export", "All leads as CSV"),
         BotCommand("help", "How to use"),
     ])
+    loop = asyncio.get_running_loop()
+
+    def on_view(lead: dict, views: int):  # called from the web server thread
+        asyncio.run_coroutine_threadsafe(notify_view(app, lead, views), loop)
+
+    try:
+        app.bot_data["web"] = web.start(on_view)
+    except OSError as err:
+        log.error("Preview server could not start: %s", err)
 
 
 def build_app(token: str) -> Application:

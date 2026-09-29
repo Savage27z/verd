@@ -281,10 +281,6 @@ async def route(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
         await msg.reply_text(plan["reply"] or "I find businesses without websites — try “barbers in Poland”.")
 
 
-async def _none():
-    return None
-
-
 async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: dict):
     msg = update.effective_message
     queries = plan["queries"]
@@ -308,8 +304,7 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: d
         include_social=plan["include_social"], exclude_place_ids=seen, region=plan["country_iso"],
         language=plan["language"], email_location=where, progress=progress,
     )
-    translate = llm.enabled() and plan["language"] not in ("", "en")
-    pitch_job = llm.localise_pitch(outreach.get_template(), plan["language"]) if translate else _none()
+    pitch_job = outreach.template_for_language(plan["language"])
     try:
         leads, pitch = await asyncio.gather(search_job, pitch_job)
     except places.PlacesError as err:

@@ -163,6 +163,19 @@ def test_any_country_search(monkeypatch, text, p, local_phone, wa_digits, pitch,
     assert store.list_searches(1)[0]["options"]["pitch"] == pitch
 
 
+def test_pitch_translation_is_cached_per_language(monkeypatch):
+    fake = use_llm(monkeypatch, "Cześć {name}!", "Olá {name}!", "Hej {name}, nowy tekst!")
+    assert asyncio.run(outreach.template_for_language("pl")) == "Cześć {name}!"
+    assert asyncio.run(outreach.template_for_language("pl")) == "Cześć {name}!"   # cached: no call
+    assert asyncio.run(outreach.template_for_language("pt")) == "Olá {name}!"
+    assert len(fake.requests) == 2
+    outreach.set_template("Hi {name}, new text!")                                  # edited pitch → re-translate
+    assert asyncio.run(outreach.template_for_language("pl")) == "Hej {name}, nowy tekst!"
+    assert len(fake.requests) == 3
+    assert asyncio.run(outreach.template_for_language("en")) == "Hi {name}, new text!"
+    assert len(fake.requests) == 3
+
+
 def test_english_speaking_country_keeps_pitch(monkeypatch):
     fake = use_llm(monkeypatch, json.dumps(plan(location_label="Austin, TX", country_iso="US", language="en",
                                                 queries=["barber Austin TX"])))

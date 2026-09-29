@@ -1,7 +1,8 @@
 """Outreach message template + WhatsApp links."""
+import hashlib
 from urllib.parse import quote
 
-from . import store
+from . import llm, store
 
 DEFAULT_TEMPLATE = (
     "Hi {name}! I found you on Google Maps and noticed you don't have a website yet. "
@@ -17,6 +18,22 @@ def get_template() -> str:
 
 def set_template(text: str | None):
     store.set_setting("template", text if text and text != DEFAULT_TEMPLATE else None)
+
+
+async def template_for_language(language: str) -> str:
+    """The current pitch in `language`. Translated once per (pitch, language) and cached, so
+    repeated searches in the same country cost no LLM calls; editing the pitch re-translates."""
+    template = get_template()
+    if not language or language == "en" or not llm.enabled():
+        return template
+    key = f"pitch:{language}:{hashlib.sha1(template.encode()).hexdigest()[:12]}"
+    cached = store.get_setting(key)
+    if cached:
+        return cached
+    translated = await llm.localise_pitch(template, language)
+    if translated != template:  # don't cache failures; try again next search
+        store.set_setting(key, translated)
+    return translated
 
 
 def fill(template: str, lead: dict) -> str:
